@@ -20,6 +20,14 @@ services:
       dockerfile: docker/Dockerfile.tracker
     container_name: hl-tracker
     restart: unless-stopped
+    # Docker <= 20.10.9's default seccomp profile blocks the clone3() syscall
+    # (returning EPERM instead of ENOSYS), and python:3.14-slim's newer glibc
+    # creates threads via clone3(). Without this, aiosqlite/asyncio can't start
+    # a thread and the worker crashes on boot with "can't start new thread".
+    # Remove this line once the host Docker is >= 20.10.10 (which allows clone3
+    # in the default profile) — it's a workaround, not a permanent requirement.
+    security_opt:
+      - seccomp=unconfined
     # Loads Telegram creds from .env (copy .env.example → .env before `up`).
     # The tracker still degrades to log-only delivery if the vars inside are
     # blank; the file itself must exist for these older Compose versions.
