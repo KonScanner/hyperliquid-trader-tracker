@@ -1,0 +1,58 @@
+[project]
+name = "hyperliquid-trader-tracker"
+version = "0.1.0"
+description = "Watch Hyperliquid wallets over the public trades firehose and push position-lifecycle notifications to Telegram."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "httpx>=0.27",
+    "websockets>=13",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "python-dotenv>=1.0",
+    "aiosqlite>=0.20",
+    "python-telegram-bot>=21.6"
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+    "ty>=0.0.1a1",
+]
+
+[project.scripts]
+hl-tracker = "tracker.app:main"
+hl-tracker-telegram-setup = "tracker.telegram_setup:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tracker"]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "TID", "PTH", "C4", "PIE"]
+ignore = ["E501"]  # line length handled by formatter
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B"]
+# The ➕/➖ glyphs in the notifications + the bot menu are deliberately confusable with +/- (RUF001).
+"src/tracker/notifier.py" = ["RUF001"]
+"src/tracker/bot.py" = ["RUF001"]
+"tests/test_notifier.py" = ["RUF001"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["error"]
+
+[tool.ty.environment]
+python-version = "3.14"

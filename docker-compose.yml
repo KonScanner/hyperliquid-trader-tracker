@@ -1,0 +1,42 @@
+# Spins up the whole stack: the tracker worker that subscribes to Hyperliquid's
+# public `trades` firehose, tracks each watched wallet's perp positions in memory,
+# and pushes lifecycle notifications (open/add/reduce/close/flip) to Telegram.
+#
+#   make up          # rebuild + start in the background (picks up code changes)
+#   docker compose up --build
+#
+# Unlike the Hyperdash dashboard, this stack has no Redis / Postgres / frontend:
+# the chain (clearinghouseState) is the durable store for positions, and the ONLY
+# thing persisted locally is the SQLite watchlist — kept on the `tracker-data`
+# volume so `/add`ed wallets survive a redeploy.
+#
+# Telegram credentials come from .env (copy .env.example → .env). Without them the
+# tracker still runs and logs notifications instead of pushing them.
+
+services:
+  tracker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.tracker
+    container_name: hl-tracker
+    restart: unless-stopped
+    # .env is optional — the tracker degrades to log-only delivery when the
+    # Telegram token/chat are absent, so a missing file shouldn't block boot.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Keep the watchlist DB on the named volume below, not the ephemeral layer.
+      - TRACKER_DB_PATH=/data/tracker.db
+    volumes:
+      - tracker-data:/data
+    networks:
+      - hl-net
+
+networks:
+  hl-net:
+    driver: bridge
+
+volumes:
+  # Persists the SQLite watchlist (the only stored state) across redeploys.
+  tracker-data:

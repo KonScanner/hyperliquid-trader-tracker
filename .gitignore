@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Tracker watchlist DB (the only local state; not committed)
+tracker.db
+tracker.db-wal
+tracker.db-shm
+
+# Claude/Other files
+.claude
+.agents
