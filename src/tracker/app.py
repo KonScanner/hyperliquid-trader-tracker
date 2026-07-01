@@ -22,6 +22,7 @@ from tracker.enrich import Enricher
 from tracker.hl_client import HyperliquidClient
 from tracker.listener import Listener
 from tracker.notifier import LoggingSender, MessageSender, Notifier
+from tracker.pnl import ClosedPnlResolver
 from tracker.registry import Registry
 
 logger = logging.getLogger(__name__)
@@ -118,7 +119,14 @@ async def _amain(settings: Settings) -> None:
             sender = LoggingSender()
 
         notifier = Notifier(sender, notify_reduce_close=settings.notify_reduce_close)
-        listener = Listener(settings, registry, book, notifier, client)
+        # No resolver when close notifications are muted — the lookup's only consumer is the
+        # close message, so fetching would just spend REST budget on a dropped event.
+        pnl_resolver = (
+            ClosedPnlResolver(settings, client)
+            if settings.closed_pnl_lookup and settings.notify_reduce_close
+            else None
+        )
+        listener = Listener(settings, registry, book, notifier, client, pnl_resolver=pnl_resolver)
 
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):

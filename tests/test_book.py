@@ -5,14 +5,14 @@ from decimal import Decimal
 
 from tracker.book import InMemoryBook, SeenTids
 from tracker.resolve import seed_state_from_row
-from tracker.state import EVENT_ADD, EVENT_OPEN
+from tracker.state import EVENT_ADD, EVENT_CLOSE, EVENT_OPEN
 
 D = Decimal
 TS = datetime(2026, 6, 15, 12, 0, tzinfo=UTC)
 
 
 def _ingest(book, address, coin, delta, px):
-    return book.ingest(address=address, coin=coin, delta=D(delta), px=D(px), ts=TS)
+    return book.ingest(address=address, coin=coin, delta=D(delta), px=D(px), ts=TS).events
 
 
 def test_first_fill_on_empty_book_opens():
@@ -42,6 +42,18 @@ def test_close_drops_the_position_from_the_book():
     _ingest(book, "0xa", "BTC", "-2", "110")
     assert book.position("0xa", "BTC") is None
     assert book.open_position_count == 0
+
+
+def test_close_surfaces_the_completed_trade_with_the_leg_window():
+    # The close notification's authoritative-PnL lookup needs the round-trip out of ingest:
+    # start_time bounds the userFillsByTime window.
+    book = InMemoryBook()
+    _ingest(book, "0xa", "BTC", "2", "100")
+    result = book.ingest(address="0xa", coin="BTC", delta=D("-2"), px=D("110"), ts=TS)
+    assert [e.kind for e in result.events] == [EVENT_CLOSE]
+    assert result.closed_trade is not None
+    assert result.closed_trade.start_time == TS
+    assert result.closed_trade.net_pnl == D(20)
 
 
 def test_reseed_replaces_and_drops_stale_coins():

@@ -69,6 +69,16 @@ class Settings(BaseSettings):
     # exit side (reduce/close) and notify only new positions + increases.
     notify_reduce_close: bool = True
 
+    # --- Authoritative close PnL (userFillsByTime lookup on close/flip) ---
+    # On a close, fetch the leg's fills once via REST and report the exchange's own summed
+    # ``closedPnl`` instead of the local average-cost estimate. The REST fill index can lag
+    # the trades feed, so the lookup retries until the closing fill is visible, then falls
+    # back to the estimate. Weight 20 per call and closes are rare — negligible against the
+    # 1200/min IP budget.
+    closed_pnl_lookup: bool = True
+    closed_pnl_attempts: int = Field(default=3, ge=1, le=10)
+    closed_pnl_retry_delay_s: float = Field(default=1.0, ge=0.0, le=10.0)
+
     # --- Persistence (the ONLY thing stored: per-subscriber watchlists) ---
     db_path: Path = Field(default=_REPO_ROOT / "tracker.db")
 

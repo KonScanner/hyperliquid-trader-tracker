@@ -11,7 +11,7 @@ from collections.abc import Iterable
 from datetime import datetime
 from decimal import Decimal
 
-from tracker.state import LiveEvent, PositionState, apply_fill
+from tracker.state import ApplyResult, PositionState, apply_fill
 
 _Key = tuple[str, str]  # (address, coin), both lowercase / as-fed
 
@@ -55,10 +55,12 @@ class InMemoryBook:
 
     def ingest(
         self, *, address: str, coin: str, delta: Decimal, px: Decimal, ts: datetime
-    ) -> list[LiveEvent]:
-        """Fold one resolved fill into the wallet's position and return the lifecycle events.
+    ) -> ApplyResult:
+        """Fold one resolved fill into the wallet's position and return the ``ApplyResult``.
 
-        The returned events are what the notifier pushes; the book updates in place.
+        Its ``events`` are what the notifier pushes; ``closed_trade`` (set on a close/flip)
+        carries the leg's time window so the close notification can fetch the exchange's own
+        realized PnL. The book updates in place.
         """
         key = (address, coin)
         state = self._positions.get(key)
@@ -68,7 +70,7 @@ class InMemoryBook:
         else:
             self._positions[key] = result.state
         self._epoch[address] = self._epoch.get(address, 0) + 1
-        return result.events
+        return result
 
     def fill_epoch(self, address: str) -> int:
         """The per-address fill counter — capture it before a reconcile snapshot's await."""

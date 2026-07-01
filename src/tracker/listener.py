@@ -21,6 +21,7 @@ from tracker.book import InMemoryBook, SeenTids
 from tracker.config import Settings
 from tracker.hl_client import InfoClient
 from tracker.notifier import Notifier
+from tracker.pnl import ClosedPnlResolver, with_authoritative_pnl
 from tracker.registry import Registry
 from tracker.resolve import perp_coins_from_meta, resolve_deltas
 
@@ -37,12 +38,15 @@ class Listener:
         book: InMemoryBook,
         notifier: Notifier,
         client: InfoClient,
+        *,
+        pnl_resolver: ClosedPnlResolver | None = None,
     ) -> None:
         self._settings = settings
         self._registry = registry
         self._book = book
         self._notifier = notifier
         self._client = client
+        self._pnl = pnl_resolver
         self._coins = settings.live_coins_list  # empty = all perps
         self._marks: dict[str, Decimal] = {}
         self._seen = SeenTids(settings.tid_dedup_maxlen)
@@ -137,14 +141,20 @@ class Listener:
             if isinstance(tid, int) and self._seen.check_and_add(tid):
                 continue
             for fill in fills:
-                events = self._book.ingest(
+                result = self._book.ingest(
                     address=fill.address, coin=fill.coin, delta=fill.delta, px=fill.px, ts=fill.ts
                 )
-                if not events:
+                if not result.events:
                     continue
                 # Fan out to every subscriber of this wallet, each with their own label.
                 recipients = self._registry.subscribers(fill.address)
-                for event in events:
+                if not recipients:
+                    continue
+                for event in result.events:
+                    # A close swaps in the exchange's own realized PnL when it resolves in
+                    # time; the local estimate stays as the fallback. This awaits on the recv
+                    # path — bounded by attempts x delay, and closes are rare.
+                    event = await with_authoritative_pnl(event, result.closed_trade, self._pnl)
                     await self._notifier.dispatch(
                         event,
                         recipients=recipients,

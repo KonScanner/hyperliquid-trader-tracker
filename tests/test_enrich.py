@@ -61,7 +61,9 @@ async def test_seeded_then_same_direction_fill_is_add_not_open():
     await _enricher(client, book).seed_wallet("0xa")
     from datetime import UTC, datetime
 
-    events = book.ingest(address="0xa", coin="BTC", delta=D(1), px=D(100), ts=datetime.now(UTC))
+    events = book.ingest(
+        address="0xa", coin="BTC", delta=D(1), px=D(100), ts=datetime.now(UTC)
+    ).events
     assert [e.kind for e in events] == [EVENT_ADD]
 
 
