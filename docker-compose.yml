@@ -20,11 +20,11 @@ services:
       dockerfile: docker/Dockerfile.tracker
     container_name: hl-tracker
     restart: unless-stopped
-    # .env is optional — the tracker degrades to log-only delivery when the
-    # Telegram token/chat are absent, so a missing file shouldn't block boot.
+    # Loads Telegram creds from .env (copy .env.example → .env before `up`).
+    # The tracker still degrades to log-only delivery if the vars inside are
+    # blank; the file itself must exist for these older Compose versions.
     env_file:
-      - path: .env
-        required: false
+      - .env
     environment:
       # Keep the watchlist DB on the named volume below, not the ephemeral layer.
       - TRACKER_DB_PATH=/data/tracker.db
