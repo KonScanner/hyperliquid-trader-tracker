@@ -48,23 +48,23 @@ pub trait MessageSender: Send + Sync {
 // → 1E+2) and the "f" format re-expands it; rust_decimal's normalize() only strips trailing
 // fractional zeros and its Display never uses scientific notation, so `.to_string()` alone
 // lands on the same text.
-fn trim(d: Decimal) -> String {
+pub(crate) fn trim(d: Decimal) -> String {
     d.normalize().to_string()
 }
 
-/// Python's ``f"{value:,.2f}"`` for the two money strings below.
+/// Thousands-grouped fixed-point, i.e. Python's ``f"{value:,.{dp}f}"``.
 // PORT NOTE: helper extracted (structural divergence — the Python inlined `:,.2f` in two
 // f-strings) because std::fmt has no thousands separator. round_dp defaults to
 // MidpointNearestEven — the same banker's rounding Decimal.__format__ applies
-// (ROUND_HALF_EVEN) — so the `{:.2}` afterwards only zero-pads, never re-rounds.
-// PORT NOTE: both call sites pass non-negative values (abs() applied / a mark price), so the
-// sign handling is defensive parity with Python's format (which renders "-" itself).
-fn comma_2f(d: Decimal) -> String {
-    let rounded = d.round_dp(2);
-    let unsigned = format!("{:.2}", rounded.abs());
-    let (int_part, frac_part) = unsigned
-        .split_once('.')
-        .expect("{:.2} always renders a fractional part");
+// (ROUND_HALF_EVEN) — so the `{:.*}` afterwards only zero-pads, never re-rounds.
+pub(crate) fn comma(d: Decimal, dp: u32) -> String {
+    let rounded = d.round_dp(dp);
+    let unsigned = format!("{:.*}", dp as usize, rounded.abs());
+    // `{:.0}` renders no dot, so the fractional part is optional.
+    let (int_part, frac_part) = match unsigned.split_once('.') {
+        Some((int_part, frac_part)) => (int_part, Some(frac_part)),
+        None => (unsigned.as_str(), None),
+    };
     let mut grouped = String::with_capacity(int_part.len() + int_part.len() / 3);
     for (i, ch) in int_part.chars().enumerate() {
         if i > 0 && (int_part.len() - i) % 3 == 0 {
@@ -73,22 +73,42 @@ fn comma_2f(d: Decimal) -> String {
         grouped.push(ch);
     }
     let sign = if rounded.is_sign_negative() { "-" } else { "" };
-    format!("{sign}{grouped}.{frac_part}")
+    match frac_part {
+        Some(frac_part) => format!("{sign}{grouped}.{frac_part}"),
+        None => format!("{sign}{grouped}"),
+    }
 }
 
 /// Signed USD PnL, e.g. ``+$2,760.00`` / ``-$440.00``; ``?`` when unknown.
 // PORT NOTE: `_pnl` → `pnl` (underscore dropped). `Decimal | None` → Option<Decimal>
 // (Decimal is Copy, so by value). `d >= 0` holds for Decimal("-0") in both languages
 // (compares equal to zero) → "+".
-fn pnl(d: Option<Decimal>) -> String {
+pub(crate) fn pnl(d: Option<Decimal>) -> String {
     let Some(d) = d else {
         return "?".to_string();
     };
     let sign = if d >= Decimal::ZERO { "+" } else { "-" };
-    format!("{sign}${}", comma_2f(d.abs()))
+    format!("{sign}${}", comma(d.abs(), 2))
 }
 
-/// Render one lifecycle event as a push message. Leads with the subscriber's ``label``.
+/// Escape user-supplied text before it goes into an HTML-parsed message.
+// Same five replacements as Python's `html.escape(s, quote=True)`, in the same order.
+// Lives here (not bot.rs) because notifications are now HTML too and the label is
+// user-supplied; bot.rs imports it.
+pub(crate) fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
+/// Render one lifecycle event as a compact two-line HTML push message.
+///
+/// Line 1 says who did what (bold label, bold coin, direction, leverage when known —
+/// unknown leverage is omitted rather than rendered as "?x"); line 2 carries the numbers.
+/// The subscriber's label is user-supplied and therefore HTML-escaped; the sender must
+/// deliver with `parse_mode=HTML` (bot.rs's TelegramSender does).
 // PORT NOTE: keyword-only params (`*, label, leverage, mark`) flattened to positional — Rust
 // has no keyword arguments (same convention as state.rs).
 // PORT NOTE: `leverage: int | None` → Option<i64>, matching the fixed dependencies that feed
@@ -100,47 +120,45 @@ pub fn format_event(
     leverage: Option<i64>,
     mark: Option<Decimal>,
 ) -> String {
-    let lev = match leverage {
-        Some(leverage) => format!("{leverage}x"),
-        None => "?x".to_string(),
-    };
-    // PORT NOTE: `coin, direction = event.coin, event.direction` — direction is the Direction
-    // enum; the format strings render it via Display ("Long"/"Short"), byte-identical to the
-    // Python str constants.
-    let (coin, direction) = (event.coin.as_str(), event.direction);
+    let lev = leverage.map(|l| format!(" {l}x")).unwrap_or_default();
+    let label = escape_html(label);
+    let coin = escape_html(&event.coin);
+    let direction = event.direction;
     let size = trim(event.delta.abs());
     let px = trim(event.px);
+    // Approximate traded notional from the live mark (absent until the first allMids tick).
+    let ntl = match mark {
+        Some(mark) => format!(" (~${})", comma(event.delta.abs() * mark, 0)),
+        None => String::new(),
+    };
 
-    if event.kind == EventKind::Open {
-        return format!("🟢 Started trade {label}: {coin} {direction} {size} @ {px} ({lev})");
+    match event.kind {
+        EventKind::Open => {
+            format!("🟢 <b>{label}</b> opened <b>{coin}</b> {direction}{lev}\n{size} @ {px}{ntl}")
+        }
+        EventKind::Add => {
+            let total = trim(event.szi_after.abs());
+            format!(
+                "➕ <b>{label}</b> added <b>{coin}</b> {direction}{lev}\n\
+                 +{size} @ {px}{ntl} → {total} total"
+            )
+        }
+        EventKind::Reduce => {
+            let left = trim(event.szi_after.abs());
+            format!(
+                "➖ <b>{label}</b> reduced <b>{coin}</b> {direction}{lev}\n\
+                 -{size} @ {px} · PnL {} · {left} left",
+                pnl(event.realized_pnl)
+            )
+        }
+        EventKind::Close => {
+            format!(
+                "🔴 <b>{label}</b> closed <b>{coin}</b> {direction}{lev}\n\
+                 {size} @ {px} · PnL {}",
+                pnl(event.realized_pnl)
+            )
+        }
     }
-    if event.kind == EventKind::Add {
-        let ntl = match mark {
-            Some(mark) => format!(" (~${})", comma_2f(event.delta.abs() * mark)),
-            None => String::new(),
-        };
-        return format!(
-            "➕ Added to position {label}: {coin} {direction} +{size}{ntl} @ {px} ({lev})"
-        );
-    }
-    if event.kind == EventKind::Reduce {
-        let remaining = trim(event.szi_after.abs());
-        return format!(
-            "➖ Reduced {label}: {coin} {direction} -{size} @ {px} \
-             | realized {} | {remaining} left",
-            pnl(event.realized_pnl)
-        );
-    }
-    if event.kind == EventKind::Close {
-        return format!(
-            "🔴 Closed {label}: {coin} {direction} {size} @ {px} | realized {}",
-            pnl(event.realized_pnl)
-        );
-    }
-    // PORT NOTE: the Python fallback handled unknown str kinds; EventKind is a closed enum
-    // (all four variants returned above), so this line is unreachable in practice — kept for
-    // structural fidelity with the Python's defensive tail.
-    format!("{} {label}: {coin} {direction} {size} @ {px}", event.kind) // defensive
 }
 
 /// A [`MessageSender`] that logs instead of pushing — the no-token fallback.
@@ -273,16 +291,19 @@ mod tests {
     #[test]
     fn test_open_format_leads_with_label_and_shows_leverage() {
         let text = format_event(
-            &event(EventKind::Open, "2.5", "0", None),
+            &event(EventKind::Open, "2.5", "2.5", None),
             "Whale-1",
             Some(10),
             None,
         );
-        assert_eq!(text, "🟢 Started trade Whale-1: BTC Long 2.5 @ 63120 (10x)");
+        assert_eq!(
+            text,
+            "🟢 <b>Whale-1</b> opened <b>BTC</b> Long 10x\n2.5 @ 63120"
+        );
     }
 
     #[test]
-    fn test_add_format_includes_notional_from_mark() {
+    fn test_add_format_includes_notional_from_mark_and_running_total() {
         let text = format_event(
             &event(EventKind::Add, "1", "3", None),
             "Whale-1",
@@ -291,14 +312,17 @@ mod tests {
         );
         assert_eq!(
             text,
-            "➕ Added to position Whale-1: BTC Long +1 (~$63,120.00) @ 63120 (10x)"
+            "➕ <b>Whale-1</b> added <b>BTC</b> Long 10x\n+1 @ 63120 (~$63,120) → 3 total"
         );
     }
 
     #[test]
-    fn test_add_format_without_mark_omits_notional() {
-        let text = format_event(&event(EventKind::Add, "1", "0", None), "W", None, None);
-        assert_eq!(text, "➕ Added to position W: BTC Long +1 @ 63120 (?x)");
+    fn test_add_format_without_mark_or_leverage_omits_both() {
+        let text = format_event(&event(EventKind::Add, "1", "3", None), "W", None, None);
+        assert_eq!(
+            text,
+            "➕ <b>W</b> added <b>BTC</b> Long\n+1 @ 63120 → 3 total"
+        );
     }
 
     #[test]
@@ -311,7 +335,7 @@ mod tests {
         );
         assert_eq!(
             text,
-            "➖ Reduced Whale-1: BTC Long -0.5 @ 63120 | realized +$440.00 | 2 left"
+            "➖ <b>Whale-1</b> reduced <b>BTC</b> Long 10x\n-0.5 @ 63120 · PnL +$440.00 · 2 left"
         );
     }
 
@@ -325,8 +349,19 @@ mod tests {
         );
         assert_eq!(
             text,
-            "🔴 Closed W: BTC Long 2 @ 63120 | realized -$1,250.50"
+            "🔴 <b>W</b> closed <b>BTC</b> Long 10x\n2 @ 63120 · PnL -$1,250.50"
         );
+    }
+
+    #[test]
+    fn test_label_is_html_escaped() {
+        let text = format_event(
+            &event(EventKind::Open, "1", "1", None),
+            "<Whale & 'co'>",
+            None,
+            None,
+        );
+        assert!(text.starts_with("🟢 <b>&lt;Whale &amp; &#x27;co&#x27;&gt;</b> opened"));
     }
 
     // --- Notifier dispatch (fan-out) --------------------------------------------------------
@@ -381,7 +416,7 @@ mod tests {
             .await;
         let sent = sender.sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
-        assert!(sent[0].1.starts_with("🟢 Started trade"));
+        assert!(sent[0].1.starts_with("🟢"));
     }
 
     #[tokio::test]
@@ -433,8 +468,11 @@ mod tests {
 //               (the `except Exception` contract — bot.rs's TelegramSender must box its
 //               client error into it). Notifier holds Arc<dyn MessageSender> (runtime
 //               sender choice in app.py; tests alias the fake). Python's f"{x:,.2f}"
-//               hand-rolled in comma_2f (std fmt lacks thousands grouping); rounding via
-//               round_dp(2) = banker's, matching Decimal.__format__. leverage int|None →
+//               hand-rolled in comma() (std fmt lacks thousands grouping); rounding via
+//               round_dp = banker's, matching Decimal.__format__. leverage int|None →
 //               Option<i64> (models.rs leverage_value). Crates: async-trait, rust_decimal,
 //               tracing (+ tokio, chrono in tests).
+//   divergence: format_event has since moved past the Python original — it now renders a
+//               two-line HTML message (escaped label, bold label/coin, leverage omitted
+//               when unknown, running total on adds) delivered with parse_mode=HTML.
 // ──────────────────────────────────────────────────────────────────────────

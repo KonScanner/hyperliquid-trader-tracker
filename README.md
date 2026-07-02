@@ -76,6 +76,7 @@ Then, in Telegram, anyone can DM the bot and manage their own watchlist:
 /remove 0x6bea…597f          stop following
 /rename 0x6bea…597f Whale     relabel
 /list                        show the wallets you follow
+/positions                   live open positions of a wallet you follow (tap to pick one)
 ```
 
 ### Configuration (env vars, or a `.env` at the repo root)

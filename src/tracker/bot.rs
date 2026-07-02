@@ -2,9 +2,10 @@
 //!
 //! A MULTI-TENANT public bot: anyone can message it and manage their own watchlist. Commands
 //! operate on the sender's own chat: `/add <address> <label…>`, `/remove <address>`,
-//! `/rename <address> <label…>`, `/list`, `/help`. Notifications for a wallet are fanned out
-//! to every subscriber of that wallet in their own chat. The core stays Telegram-free (this
-//! module is only wired up by `tracker::app` when a bot token is configured).
+//! `/rename <address> <label…>`, `/list`, `/positions [address]`, `/help`. Notifications for
+//! a wallet are fanned out to every subscriber of that wallet in their own chat. The core
+//! stays Telegram-free (this module is only wired up by `tracker::app` when a bot token is
+//! configured).
 //!
 //! The menu is presented with HTML formatting + an inline-button keyboard, and the persistent
 //! slash-command menu (the Menu button) is registered via [`SettingsBot::configure`]. All
@@ -31,13 +32,15 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use rust_decimal::Decimal;
 use serde_json::{Value, json};
 
 use crate::book::InMemoryBook;
 use crate::config::{self, Settings};
 use crate::db::WatchlistDB;
 use crate::enrich::Enricher;
-use crate::notifier::{MessageSender, SendError};
+use crate::models::AccountPosition;
+use crate::notifier::{MessageSender, SendError, comma, escape_html as h, pnl, trim};
 use crate::registry::{Registry, normalize_address};
 
 /// What a handler may fail with.
@@ -272,17 +275,9 @@ impl Application {
 
 // ──────────────────────────────────────────────────────────────────────────
 
-/// Escape user-supplied text before it goes into an HTML-parsed message.
-// PORT NOTE: `_h = html.escape` (module alias, quote=True default) → fn reproducing the same
-// five replacements in the same order (&, <, >, ", ').
-// PERF(port): five allocate-per-pass replaces — profile in Phase B (labels are tiny).
-fn h(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#x27;")
-}
+// The HTML-escape helper (`_h = html.escape` in the Python) now lives in notifier.rs as
+// `escape_html`, imported above as `h` — notifications are HTML-formatted too and the
+// escaped label is theirs.
 
 // The /start · /help · Help-button message. `<code>…</code>` renders the command syntax in
 // monospace; the literal angle brackets in placeholders are escaped (&lt; / &gt;).
@@ -295,7 +290,8 @@ const HELP: &str = "🟢 <b>Hyperliquid Wallet Tracker</b>\n\n\
     ➕ <code>/add &lt;address&gt; &lt;label&gt;</code> — follow a wallet\n\
     ➖ <code>/remove &lt;address&gt;</code> — stop following\n\
     ✏️ <code>/rename &lt;address&gt; &lt;label&gt;</code> — relabel\n\
-    📃 <code>/list</code> — show the wallets you follow\n\n\
+    📃 <code>/list</code> — show the wallets you follow\n\
+    📊 <code>/positions</code> — live open positions of a wallet you follow\n\n\
     Tip: tap a button below to get started.";
 
 // Tappable inline keyboard under the menu. The `callback_data` payloads are dispatched by
@@ -307,6 +303,7 @@ static MENU_KEYBOARD: LazyLock<Value> = LazyLock::new(|| {
     json!({
         "inline_keyboard": [[
             { "text": "📃 My wallets", "callback_data": "list" },
+            { "text": "📊 Positions", "callback_data": "positions" },
             { "text": "❓ Help", "callback_data": "help" },
         ]]
     })
@@ -314,7 +311,7 @@ static MENU_KEYBOARD: LazyLock<Value> = LazyLock::new(|| {
 
 // The persistent slash-command menu (the blue Menu button + "/" autocomplete). Descriptions are
 // plain text — Telegram does not parse HTML here.
-static COMMANDS: [BotCommand; 5] = [
+static COMMANDS: [BotCommand; 6] = [
     BotCommand {
         command: "add",
         description: "Follow a wallet — /add <address> <label>",
@@ -330,6 +327,10 @@ static COMMANDS: [BotCommand; 5] = [
     BotCommand {
         command: "list",
         description: "Show the wallets you follow",
+    },
+    BotCommand {
+        command: "positions",
+        description: "Live open positions of a wallet you follow",
     },
     BotCommand {
         command: "help",
@@ -352,14 +353,14 @@ impl TelegramSender {
 
 #[async_trait]
 impl MessageSender for TelegramSender {
-    // PORT NOTE: notifications go out as PLAIN text — no parse_mode, no keyboard — exactly
-    // the Python's `send_message(chat_id=chat_id, text=text)`. The raising `-> None` becomes
-    // Result<(), SendError>: the reqwest error is boxed into notifier.rs's type-erased
-    // SendError (its contract for Notifier.dispatch's `except Exception`).
+    // Notifications go out HTML-formatted (format_event escapes the user-supplied label), no
+    // keyboard. The raising `-> None` becomes Result<(), SendError>: the reqwest error is
+    // boxed into notifier.rs's type-erased SendError (its contract for Notifier.dispatch's
+    // `except Exception`).
     async fn send(&self, chat_id: i64, text: &str) -> std::result::Result<(), SendError> {
         self.app
             .bot()
-            .send_message(chat_id, text, None, None)
+            .send_message(chat_id, text, Some(PARSE_MODE_HTML), None)
             .await?;
         Ok(())
     }
@@ -454,6 +455,7 @@ impl SettingsBot {
             "remove" => self.cmd_remove(update, &args).await,
             "rename" => self.cmd_rename(update, &args).await,
             "list" => self.cmd_list(update, &args).await,
+            "positions" => self.cmd_positions(update, &args).await,
             _ => Ok(()),
         }
     }
@@ -479,7 +481,6 @@ impl SettingsBot {
     // PORT NOTE: returns Result<String> — the reply text on success; the Python let db errors
     // raise into PTB's logger, `?` propagates them to handle_update's caller instead.
     pub async fn add_wallet(&self, chat_id: i64, address: &str, label: &str) -> Result<String> {
-        let short = Registry::short(address);
         // Seed a wallet nobody tracks yet BEFORE it enters the filter; a wallet already tracked
         // by someone else is already seeded, so this short-circuits and the new subscriber joins.
         // PORT NOTE: is_tracked is read under a lock captured into a local so the guard drops
@@ -494,7 +495,7 @@ impl SettingsBot {
         if !tracked && !self.enricher.seed_wallet(address).await {
             self.db.add(chat_id, address, label).await?;
             return Ok(format!(
-                "💾 Saved <b>{}</b> (<code>{short}</code>) but I couldn't read its \
+                "💾 Saved <b>{}</b> (<code>{address}</code>) but I couldn't read its \
                  current positions — it'll go live on the next reconcile.",
                 h(label)
             ));
@@ -505,7 +506,7 @@ impl SettingsBot {
             .expect("registry mutex poisoned")
             .subscribe(chat_id, address, label);
         Ok(format!(
-            "✅ Now following <b>{}</b> (<code>{short}</code>).",
+            "✅ Now following <b>{}</b> (<code>{address}</code>).",
             h(label)
         ))
     }
@@ -544,13 +545,17 @@ impl SettingsBot {
         Some(id)
     }
 
-    /// Reply in the update's chat with HTML formatting (works for commands and button taps).
-    // PORT NOTE: keyword-only `keyboard: bool = False` default flattened to a required
-    // positional (guide option (a)) — every call site passes it explicitly.
+    /// Reply in the update's chat with HTML formatting and an arbitrary inline keyboard
+    /// (the /positions picker builds its own).
     // PORT NOTE: `message.reply_text(...)` → send_message to the message's own chat id; the
     // `if message is not None` guard folds into the chained Option (a chat/id-less raw message
     // also no-ops, which PTB's typed Message made impossible).
-    async fn reply(&self, update: &Update, text: &str, keyboard: bool) -> Result<()> {
+    async fn reply_with_markup(
+        &self,
+        update: &Update,
+        text: &str,
+        reply_markup: Option<&Value>,
+    ) -> Result<()> {
         let Some(chat_id) = update
             .effective_message()
             .and_then(|m| m.get("chat"))
@@ -561,19 +566,26 @@ impl SettingsBot {
         };
         self.app
             .bot()
-            .send_message(
-                chat_id,
-                text,
-                Some(PARSE_MODE_HTML),
-                // `reply_markup=_MENU_KEYBOARD if keyboard else None`
-                if keyboard {
-                    Some(&*MENU_KEYBOARD)
-                } else {
-                    None
-                },
-            )
+            .send_message(chat_id, text, Some(PARSE_MODE_HTML), reply_markup)
             .await?;
         Ok(())
+    }
+
+    /// Reply in the update's chat with HTML formatting (works for commands and button taps).
+    // PORT NOTE: keyword-only `keyboard: bool = False` default flattened to a required
+    // positional (guide option (a)) — every call site passes it explicitly.
+    async fn reply(&self, update: &Update, text: &str, keyboard: bool) -> Result<()> {
+        // `reply_markup=_MENU_KEYBOARD if keyboard else None`
+        self.reply_with_markup(
+            update,
+            text,
+            if keyboard {
+                Some(&*MENU_KEYBOARD)
+            } else {
+                None
+            },
+        )
+        .await
     }
 
     // PORT NOTE: `_ctx: ContextTypes.DEFAULT_TYPE` (unused) → `_args` — the dispatcher hands
@@ -602,11 +614,15 @@ impl SettingsBot {
         if self.chat_id(update).is_none() {
             return Ok(());
         }
-        if query.get("data").and_then(Value::as_str) == Some("list") {
-            self.show_list(update).await
-        } else {
+        match query.get("data").and_then(Value::as_str) {
+            Some("list") => self.show_list(update).await,
+            Some("positions") => self.positions_picker(update).await,
+            // A wallet button from the /positions picker carries its full address.
+            Some(data) if data.starts_with("pos:") => {
+                self.show_positions(update, &data["pos:".len()..]).await
+            }
             // "help" (and any unknown payload) falls back to the menu
-            self.reply(update, HELP, true).await
+            _ => self.reply(update, HELP, true).await,
         }
     }
 
@@ -681,12 +697,11 @@ impl SettingsBot {
             return Ok(());
         };
         let existed = self.remove_wallet(chat_id, &address).await?;
-        let short = Registry::short(&address);
         // PORT NOTE: Python's conditional expression inside the call → a bound local.
         let text = if existed {
-            format!("🗑️ Stopped following <code>{short}</code>.")
+            format!("🗑️ Stopped following <code>{address}</code>.")
         } else {
-            format!("You weren't following <code>{short}</code>.")
+            format!("You weren't following <code>{address}</code>.")
         };
         self.reply(update, &text, false).await
     }
@@ -704,7 +719,6 @@ impl SettingsBot {
             return Ok(());
         };
         let label = args[1..].join(" ").trim().to_string();
-        let short = Registry::short(&address);
         if self.db.rename(chat_id, &address, &label).await? {
             // PORT NOTE: the registry rename's bool is discarded, as the Python discarded it
             // (the DB row is the source of truth for "was subscribed").
@@ -714,14 +728,17 @@ impl SettingsBot {
                 .rename(chat_id, &address, &label);
             self.reply(
                 update,
-                &format!("✏️ Renamed to <b>{}</b> (<code>{short}</code>).", h(&label)),
+                &format!(
+                    "✏️ Renamed to <b>{}</b> (<code>{address}</code>).",
+                    h(&label)
+                ),
                 false,
             )
             .await
         } else {
             self.reply(
                 update,
-                &format!("You aren't following <code>{short}</code>."),
+                &format!("You aren't following <code>{address}</code>."),
                 false,
             )
             .await
@@ -730,6 +747,103 @@ impl SettingsBot {
 
     async fn cmd_list(&self, update: &Update, _args: &[String]) -> Result<()> {
         self.show_list(update).await
+    }
+
+    /// `/positions [address]` — live open positions of a wallet the sender follows.
+    /// Without an address it offers a tappable picker of the sender's wallets.
+    async fn cmd_positions(&self, update: &Update, args: &[String]) -> Result<()> {
+        if self.chat_id(update).is_none() {
+            return Ok(());
+        }
+        match args.first() {
+            None => self.positions_picker(update).await,
+            Some(raw) => match normalize_address(raw) {
+                Ok(address) => self.show_positions(update, &address).await,
+                Err(_) => {
+                    self.reply(
+                        update,
+                        &format!("⚠️ Not a valid address: <code>{}</code>", h(raw)),
+                        false,
+                    )
+                    .await
+                }
+            },
+        }
+    }
+
+    /// One tappable button per followed wallet (shared by /positions and the 📊 button).
+    /// A single-wallet watchlist skips the picker and answers directly.
+    async fn positions_picker(&self, update: &Update) -> Result<()> {
+        let Some(chat_id) = self.chat_id(update) else {
+            return Ok(());
+        };
+        let wallets = self.db.list_for(chat_id).await?;
+        if wallets.is_empty() {
+            self.reply(
+                update,
+                "You're not following any wallets yet. Add one with \
+                 <code>/add &lt;address&gt; &lt;label&gt;</code>.",
+                true,
+            )
+            .await?;
+            return Ok(());
+        }
+        let mut items: Vec<(String, String)> = wallets.into_iter().collect();
+        if let [(address, _)] = items.as_slice() {
+            let address = address.clone();
+            return self.show_positions(update, &address).await;
+        }
+        // Sorted by (label, address) so the buttons keep a stable order across taps.
+        items.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        let rows: Vec<Value> = items
+            .iter()
+            .map(|(addr, label)| json!([{ "text": label, "callback_data": format!("pos:{addr}") }]))
+            .collect();
+        self.reply_with_markup(
+            update,
+            "📊 Whose positions?",
+            Some(&json!({ "inline_keyboard": rows })),
+        )
+        .await
+    }
+
+    /// Fetch + render one followed wallet's live open positions.
+    async fn show_positions(&self, update: &Update, address: &str) -> Result<()> {
+        let Some(chat_id) = self.chat_id(update) else {
+            return Ok(());
+        };
+        // Only wallets the sender follows — their own label doubles as the header.
+        let wallets = self.db.list_for(chat_id).await?;
+        let Some(label) = wallets.get(address) else {
+            self.reply(
+                update,
+                &format!("You aren't following <code>{address}</code>."),
+                false,
+            )
+            .await?;
+            return Ok(());
+        };
+        match self.enricher.account_positions(address).await {
+            Ok(positions) => {
+                self.reply(update, &format_positions(label, address, &positions), false)
+                    .await
+            }
+            // Best-effort read: a transient clearinghouseState failure shouldn't bubble out
+            // of the handler — log it and tell the user instead.
+            Err(err) => {
+                tracing::error!("/positions: clearinghouseState failed for {address}: {err:?}");
+                self.reply(
+                    update,
+                    &format!(
+                        "⚠️ Couldn't fetch positions for <b>{}</b> right now — try again in a \
+                         moment.",
+                        h(label)
+                    ),
+                    false,
+                )
+                .await
+            }
+        }
     }
 
     /// Render the sender's watchlist (shared by /list and the 📃 My wallets button).
@@ -754,15 +868,11 @@ impl SettingsBot {
         // exactly Python's tuple comparison; addresses are unique so the label never ties.
         let mut items: Vec<(String, String)> = wallets.into_iter().collect();
         items.sort();
+        // Full address, tap-to-copy: <code> copies its exact contents in Telegram, and a
+        // truncated 0x1234…abcd form would copy the ellipsis version (not a valid address).
         let lines: Vec<String> = items
             .iter()
-            .map(|(addr, label)| {
-                format!(
-                    "• <b>{}</b> — <code>{}</code>",
-                    h(label),
-                    Registry::short(addr)
-                )
-            })
+            .map(|(addr, label)| format!("• <b>{}</b> — <code>{addr}</code>", h(label)))
             .collect();
         self.reply(
             update,
@@ -770,6 +880,130 @@ impl SettingsBot {
             false,
         )
         .await
+    }
+}
+
+/// Render one wallet's live open positions — the `/positions` view (pure, unit-tested).
+///
+/// Largest position (by USD value) first. Per position: size @ avg entry, current value,
+/// unrealized PnL, and the liquidation price when the exchange reports one. The full address
+/// sits in `<code>` so a tap copies something actually usable.
+fn format_positions(label: &str, address: &str, positions: &[AccountPosition]) -> String {
+    let header = format!("📊 <b>{}</b> — <code>{address}</code>", h(label));
+    if positions.is_empty() {
+        return format!("{header}\n\nNo open positions.");
+    }
+    let mut sorted: Vec<&AccountPosition> = positions.iter().collect();
+    sorted.sort_by(|a, b| {
+        let value = |p: &AccountPosition| p.position_value.map(|v| v.abs());
+        value(b).cmp(&value(a)).then_with(|| a.coin.cmp(&b.coin))
+    });
+    let blocks: Vec<String> = sorted
+        .iter()
+        .map(|p| {
+            // account_positions only hands over non-zero sizes; a missing szi renders as 0 Long.
+            let szi = p.szi.unwrap_or_default();
+            let direction = if szi < Decimal::ZERO { "Short" } else { "Long" };
+            let lev = p
+                .leverage_value
+                .map(|l| format!(" {l}x"))
+                .unwrap_or_default();
+            let entry = p.entry_px.map(trim).unwrap_or_else(|| "?".to_string());
+            let mut detail = format!("{} @ {entry}", trim(szi.abs()));
+            if let Some(value) = p.position_value {
+                detail.push_str(&format!(" (~${})", comma(value.abs(), 0)));
+            }
+            detail.push_str(&format!(" · uPnL {}", pnl(p.unrealized_pnl)));
+            if let Some(liq) = p.liquidation_px {
+                detail.push_str(&format!(" · liq {}", trim(liq)));
+            }
+            format!("<b>{}</b> {direction}{lev}\n{detail}", h(&p.coin))
+        })
+        .collect();
+    format!("{header}\n\n{}", blocks.join("\n\n"))
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// tests — Rust-only (bot.py had no test file); pin the pure /positions renderer.
+// ──────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    fn d(s: &str) -> Option<Decimal> {
+        Some(Decimal::from_str(s).expect("test literal is a valid decimal"))
+    }
+
+    fn addr() -> String {
+        format!("0x{}", "ab".repeat(20))
+    }
+
+    fn position(
+        coin: &str,
+        szi: &str,
+        entry: &str,
+        value: &str,
+        upnl: &str,
+        leverage: Option<i64>,
+        liq: Option<&str>,
+    ) -> AccountPosition {
+        AccountPosition {
+            address: addr(),
+            coin: coin.to_string(),
+            szi: d(szi),
+            entry_px: d(entry),
+            position_value: d(value),
+            unrealized_pnl: d(upnl),
+            liquidation_px: liq.and_then(d),
+            leverage_type: None,
+            leverage_value: leverage,
+            max_leverage: None,
+        }
+    }
+
+    #[test]
+    fn test_format_positions_sorts_by_value_and_renders_each_line() {
+        let text = format_positions(
+            "Whale-1",
+            &addr(),
+            &[
+                position(
+                    "ETH",
+                    "-2",
+                    "2500",
+                    "5000",
+                    "-12.5",
+                    Some(10),
+                    Some("3100.5"),
+                ),
+                position("GRAM", "39102", "1.6444", "64624", "123.45", Some(5), None),
+            ],
+        );
+        assert_eq!(
+            text,
+            format!(
+                "📊 <b>Whale-1</b> — <code>{}</code>\n\n\
+                 <b>GRAM</b> Long 5x\n\
+                 39102 @ 1.6444 (~$64,624) · uPnL +$123.45\n\n\
+                 <b>ETH</b> Short 10x\n\
+                 2 @ 2500 (~$5,000) · uPnL -$12.50 · liq 3100.5",
+                addr()
+            )
+        );
+    }
+
+    #[test]
+    fn test_format_positions_empty_and_label_escaped() {
+        let text = format_positions("<W&>", &addr(), &[]);
+        assert_eq!(
+            text,
+            format!(
+                "📊 <b>&lt;W&amp;&gt;</b> — <code>{}</code>\n\nNo open positions.",
+                addr()
+            )
+        );
     }
 }
 
@@ -791,4 +1025,8 @@ impl SettingsBot {
 //               to log-and-continue, replacing PTB's error logger. Crates: reqwest,
 //               serde_json, thiserror, async-trait, tokio-rusqlite (error type only), tokio
 //               (runtime).
+//   divergence: post-port additions with no Python counterpart — /positions (picker keyboard
+//               + Enricher::account_positions + format_positions), full addresses in <code>
+//               (tap-to-copy), notifications delivered as HTML (escape_html moved to
+//               notifier.rs).
 // ──────────────────────────────────────────────────────────────────────────

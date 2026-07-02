@@ -23,18 +23,19 @@ use crate::config::Settings;
 // bare `except Exception` matched them anonymously); the SeedError reshape below needs the name.
 use crate::exceptions::TrackerError;
 use crate::hl_client::InfoClient;
-use crate::models::{self, build_position};
+use crate::models::{self, AccountPosition, build_position};
 use crate::resolve::seed_state_from_row;
 use crate::state::PositionState;
 
-/// The closed union of everything `seed_wallet`'s Python `try:` block could raise.
+/// The closed union of everything a `clearinghouseState` snapshot can fail with.
 // PORT NOTE: reshape per the fixed decisions — Python's broad `except Exception` in seed_wallet
 // caught (a) a TrackerError out of `client.info` and (b) the pydantic-ValidationError analogue
-// (models::Error) out of `build_position`. The private snapshot_positions() helper returns this
-// enum so seed_wallet's match covers exactly those causes; anything else Python could have
+// (models::Error) out of `build_position`. snapshot_positions() returns this enum so
+// seed_wallet's match covers exactly those causes; anything else Python could have
 // caught there (a genuine bug) is a panic in Rust and deliberately NOT swallowed.
+// pub because `account_positions` (the bot's /positions data source) surfaces it too.
 #[derive(thiserror::Error, Debug)]
-enum SeedError {
+pub enum SeedError {
     /// Transport/HTTP failure from `InfoClient::info`.
     #[error(transparent)]
     Client(#[from] TrackerError),
@@ -113,21 +114,19 @@ impl Enricher {
         }
     }
 
-    /// Fetch `clearinghouseState` for `address` and parse it into seed states + leverage.
-    // PORT NOTE: structural addition (fixed decision for enrich.py) — this is seed_wallet's
-    // Python `try:` block verbatim; extracting it lets `?` replace exception propagation while
-    // seed_wallet keeps the Python's log-and-return-false shape.
-    async fn snapshot_positions(
+    /// Fetch and parse `address`'s live open positions (non-zero size, malformed rows skipped).
+    ///
+    /// The fetch+parse half of the seed path, shared with the bot's `/positions` view — which
+    /// is why it returns the full [`AccountPosition`] rows (entry px, value, unrealized PnL,
+    /// liquidation px, leverage) rather than just seed states.
+    pub async fn account_positions(
         &self,
         address: &str,
-    ) -> Result<(Vec<PositionState>, HashMap<String, i64>), SeedError> {
+    ) -> Result<Vec<AccountPosition>, SeedError> {
         let resp = self
             .client
             .info(json!({"type": "clearinghouseState", "user": address}))
             .await?;
-        let now = Utc::now();
-        let mut states: Vec<PositionState> = Vec::new();
-        let mut leverage: HashMap<String, i64> = HashMap::new();
         // `(resp or {}).get("assetPositions") or []` — Python's `or {}` only rescued FALSY
         // responses (null/false/0/""/[]/{} → a deliberate empty seed); a TRUTHY non-dict hit
         // AttributeError, which seed_wallet's `except Exception` turned into a FAILED seed so
@@ -151,6 +150,7 @@ impl Enricher {
                 .into());
             }
         };
+        let mut positions: Vec<AccountPosition> = Vec::new();
         for entry in entries {
             // PORT NOTE: build_position's two failure exits (fixed decision): Ok(None) = the
             // Python `pos is None` arm, Err = a numeric field failed decimal coercion (the
@@ -158,10 +158,33 @@ impl Enricher {
             let Some(pos) = build_position(address, entry)? else {
                 continue; // skip malformed
             };
-            // `not pos.szi` — Money truthiness: None and zero are both falsy → skip. The
+            // `not pos.szi` — Money truthiness: None and zero are both falsy → skip.
+            if pos.szi.filter(|s| !s.is_zero()).is_none() {
+                continue; // skip zero-size
+            }
+            positions.push(pos);
+        }
+        Ok(positions)
+    }
+
+    /// Fetch `clearinghouseState` for `address` and parse it into seed states + leverage.
+    // PORT NOTE: structural addition (fixed decision for enrich.py) — this is seed_wallet's
+    // Python `try:` block verbatim; extracting it lets `?` replace exception propagation while
+    // seed_wallet keeps the Python's log-and-return-false shape. The fetch+parse half has
+    // since been factored into `account_positions` above (shared with the bot).
+    async fn snapshot_positions(
+        &self,
+        address: &str,
+    ) -> Result<(Vec<PositionState>, HashMap<String, i64>), SeedError> {
+        let positions = self.account_positions(address).await?;
+        let now = Utc::now();
+        let mut states: Vec<PositionState> = Vec::new();
+        let mut leverage: HashMap<String, i64> = HashMap::new();
+        for pos in positions {
+            // account_positions only returns non-zero sizes; stay defensive anyway. The
             // unwrapped non-zero Decimal is exactly what seed_state_from_row's `szi` takes.
             let Some(szi) = pos.szi.filter(|s| !s.is_zero()) else {
-                continue; // skip zero-size
+                continue;
             };
             // PORT NOTE: keyword-only `fallback_ts=now` flattened to positional (resolve.rs);
             // `entry_px: Decimal | None` is models.rs's Money, passed through unchanged.
@@ -380,6 +403,24 @@ mod tests {
             events.iter().map(|e| e.kind).collect::<Vec<_>>(),
             vec![EventKind::Add]
         );
+    }
+
+    #[tokio::test]
+    async fn test_account_positions_returns_parsed_rows() {
+        let book = Arc::new(Mutex::new(InMemoryBook::new()));
+        let client = FakeInfoClient {
+            responses: HashMap::from([("0xa".to_string(), chs("BTC", "5", "90", 10))]),
+            fail: HashSet::new(),
+        };
+        let positions = enricher(client, book)
+            .account_positions("0xa")
+            .await
+            .expect("canned snapshot parses");
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].coin, "BTC");
+        assert_eq!(positions[0].szi, Some(d("5")));
+        assert_eq!(positions[0].entry_px, Some(d("90")));
+        assert_eq!(positions[0].leverage_value, Some(10));
     }
 
     #[tokio::test]
