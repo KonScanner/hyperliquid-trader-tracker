@@ -5,8 +5,9 @@
 # binaries on a slim Debian base. The only thing persisted is the SQLite watchlist,
 # which lives on a mounted volume (see docker-compose.yml). Build context is the repo root.
 
-# Pin the same Debian release for build and runtime so glibc versions match.
-FROM rust:1.95-slim-trixie AS build
+# Build on Bullseye to avoid old Docker seccomp blocking clone3 during Cargo thread startup.
+# The resulting binary runs on the newer Trixie runtime glibc below.
+FROM rust:1.95-slim-bullseye AS build
 
 WORKDIR /app
 
@@ -22,12 +23,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp target/release/hl-tracker target/release/hl-tracker-telegram-setup /out/
 
 FROM debian:trixie-slim
+COPY --from=build /out/hl-tracker /out/hl-tracker-telegram-setup /usr/local/bin/
 
-# ca-certificates: reqwest's rustls backend verifies Telegram/Hyperliquid TLS against
-# the system store.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# reqwest/rustls verifies Telegram/Hyperliquid TLS against the system CA bundle.
+# Copy it from the builder image to avoid running apt in this low-memory Docker host.
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 # Non-root user + the watchlist DB directory. /data is chowned to appuser so the named
 # volume mounted there (see docker-compose.yml) inherits writable ownership on first use.
@@ -35,8 +35,6 @@ RUN apt-get update \
 RUN useradd --create-home --shell /usr/sbin/nologin appuser \
     && mkdir -p /data \
     && chown appuser:appuser /data
-
-COPY --from=build /out/hl-tracker /out/hl-tracker-telegram-setup /usr/local/bin/
 
 USER appuser
 
