@@ -1,0 +1,46 @@
+# syntax=docker/dockerfile:1.9
+# The tracker worker (`hl-tracker`), Rust edition — the port of Dockerfile.tracker.
+# Builds the crate with cargo (rusqlite is `bundled`, reqwest/tungstenite use rustls,
+# so no libsqlite3/openssl dev packages are needed), then ships the two static-ish
+# binaries on a slim Debian base. The only thing persisted is the SQLite watchlist,
+# which lives on a mounted volume (see docker-compose.yml). Build context is the repo root.
+
+# Pin the same Debian release for build and runtime so glibc versions match.
+FROM rust:1.95-slim-trixie AS build
+
+WORKDIR /app
+
+# One cached build: registry + target dir live in cache mounts, sources are bind-mounted,
+# and the binaries are copied out of the cache before the mounts unwind.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/app/target \
+    --mount=type=bind,source=Cargo.toml,target=Cargo.toml \
+    --mount=type=bind,source=Cargo.lock,target=Cargo.lock \
+    --mount=type=bind,source=src,target=src \
+    cargo build --release --locked \
+    && mkdir -p /out \
+    && cp target/release/hl-tracker target/release/hl-tracker-telegram-setup /out/
+
+FROM debian:trixie-slim
+
+# ca-certificates: reqwest's rustls backend verifies Telegram/Hyperliquid TLS against
+# the system store.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Non-root user + the watchlist DB directory. /data is chowned to appuser so the named
+# volume mounted there (see docker-compose.yml) inherits writable ownership on first use.
+# (useradd, not adduser: Debian 13 "trixie" slim dropped the adduser perl wrapper.)
+RUN useradd --create-home --shell /usr/sbin/nologin appuser \
+    && mkdir -p /data \
+    && chown appuser:appuser /data
+
+COPY --from=build /out/hl-tracker /out/hl-tracker-telegram-setup /usr/local/bin/
+
+USER appuser
+
+# Keep the SQLite watchlist on the mounted volume, not the ephemeral image layer.
+ENV TRACKER_DB_PATH=/data/tracker.db
+
+CMD ["hl-tracker"]

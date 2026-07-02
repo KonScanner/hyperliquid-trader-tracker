@@ -1,0 +1,43 @@
+[package]
+name = "hyperliquid-trader-tracker"
+version = "0.1.0"
+edition = "2024"
+description = "Watch Hyperliquid wallets over the public trades firehose and push position-lifecycle notifications to Telegram."
+license = "MIT"
+
+# PORT NOTE: the lib root is src/tracker/mod.rs (not src/lib.rs) so every
+# ported foo.rs sits next to the foo.py it was translated from — the Python
+# package src/tracker/ IS the Rust crate.
+[lib]
+name = "tracker"
+path = "src/tracker/mod.rs"
+
+[[bin]]
+name = "hl-tracker"
+path = "src/main.rs"
+
+[[bin]]
+name = "hl-tracker-telegram-setup"
+path = "src/telegram_setup_main.rs"
+
+[dependencies]
+async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+dotenvy = "0.15"
+futures-util = "0.3"
+rand = "0.10"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+rust_decimal = { version = "1", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-rusqlite = "0.7"
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"

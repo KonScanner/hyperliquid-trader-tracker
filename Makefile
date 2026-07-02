@@ -1,4 +1,5 @@
-.PHONY: format lint typecheck test check run lock up down logs
+.PHONY: format lint typecheck test check run lock up down logs \
+        format-rs lint-rs test-rs check-rs build-rs run-rs
 
 # This machine leaks the system site-packages onto PYTHONPATH, which shadows the
 # venv's typing_extensions; clear it for every recipe so the venv is authoritative.
@@ -26,8 +27,29 @@ typecheck:
 test:
 	uv run pytest -q
 
-# Everything green before shipping: ruff + ty + pytest.
-check: lint typecheck test
+# Everything green before shipping: ruff + ty + pytest, plus the Rust port's checks.
+check: lint typecheck test check-rs
+
+# ---- Rust port (the .rs files next to each .py; Cargo.toml at the repo root) ----
+format-rs:
+	cargo fmt --all
+
+# Non-mutating lint (CI shape); `make format-rs` is the mutating fixer.
+lint-rs:
+	cargo clippy --all-targets -- -D warnings
+
+test-rs:
+	cargo test
+
+# Everything green before shipping (Rust): fmt --check + clippy -D warnings + tests.
+check-rs: lint-rs test-rs
+	cargo fmt --all --check
+
+build-rs:
+	cargo build --release
+
+run-rs:
+	cargo run --release --bin hl-tracker
 
 # ---- Run ----
 # Run the tracker locally against the repo-root .env (log-only without a Telegram token).

@@ -1,5 +1,6 @@
-# Keep the build context small — the Dockerfile only needs src/, pyproject.toml,
-# uv.lock and README.md; everything below would just be sent to the daemon.
+# Keep the build context small — the Python image needs src/, pyproject.toml, uv.lock
+# and README.md; the Rust image needs src/, Cargo.toml and Cargo.lock. Everything below
+# would just be sent to the daemon.
 .git
 .venv
 .ruff_cache
@@ -7,6 +8,9 @@
 .mypy_cache
 __pycache__/
 *.py[codz]
+
+# Rust build output (cargo rebuilds inside the image's cache mount).
+target/
 
 # Local state / secrets — never bake these into an image.
 .env

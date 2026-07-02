@@ -17,7 +17,9 @@ services:
   tracker:
     build:
       context: .
-      dockerfile: docker/Dockerfile.tracker
+      # The Rust port of the tracker; docker/Dockerfile.tracker is the original
+      # Python image, kept while both implementations live side by side.
+      dockerfile: docker/Dockerfile.tracker-rs
     container_name: hl-tracker
     restart: unless-stopped
     # Docker <= 20.10.9's default seccomp profile blocks the clone3() syscall
