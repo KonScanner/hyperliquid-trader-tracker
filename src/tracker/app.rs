@@ -240,7 +240,7 @@ async fn amain(settings: Settings) -> Result<()> {
         application = Some(app);
     } else {
         tracing::warn!("no TELEGRAM_BOT_TOKEN configured — notifications will be logged only");
-        sender = Arc::new(LoggingSender);
+        sender = Arc::new(LoggingSender::default());
     }
 
     let notifier = Notifier::new(sender, settings.notify_reduce_close);

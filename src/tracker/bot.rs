@@ -143,18 +143,20 @@ impl Bot {
         format!("{API}/bot{}/{method}", self.token)
     }
 
-    /// `bot.send_message(...)`.
+    /// `bot.send_message(...)`, returning the new message's id so a later fill can edit it.
     // PORT NOTE: PTB's keyword defaults (`parse_mode=None`, `reply_markup=None`) flattened to
     // required Option params (guide option (b): absence is semantic — plain text vs HTML,
     // keyboard vs none). PTB raised TelegramError on an `ok: false` payload; the Bot API sets
     // a non-2xx status on exactly those, so `error_for_status()` is the equivalent raise.
+    // DIVERGENCE (edit-mode cards): the Python discarded the response; here we parse and return
+    // `result.message_id` so the notifier can edit this card in place on the next fill.
     pub async fn send_message(
         &self,
         chat_id: i64,
         text: &str,
         parse_mode: Option<&str>,
         reply_markup: Option<&Value>,
-    ) -> reqwest::Result<()> {
+    ) -> reqwest::Result<i64> {
         let mut body = json!({ "chat_id": chat_id, "text": text });
         if let Some(parse_mode) = parse_mode {
             body["parse_mode"] = json!(parse_mode);
@@ -162,8 +164,46 @@ impl Bot {
         if let Some(reply_markup) = reply_markup {
             body["reply_markup"] = reply_markup.clone();
         }
-        self.client
+        let resp = self
+            .client
             .post(self.url("sendMessage"))
+            .json(&body)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(redact)?;
+        // The Bot API always carries `result.message_id` on success; default to 0 defensively
+        // (an untrackable card — a later edit just falls back to a fresh send).
+        let payload: Value = resp.json().await.map_err(redact)?;
+        Ok(payload
+            .get("result")
+            .and_then(|result| result.get("message_id"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0))
+    }
+
+    /// `bot.edit_message_text(...)` — replace the text of a previously-sent message in place.
+    /// Editing does not re-notify the chat, so it is the silent update the notifier relies on.
+    // DIVERGENCE (edit-mode cards): no Python counterpart — the Python sent a new message per
+    // fill. Fails (non-2xx) when the message is gone or past Telegram's edit window; the
+    // notifier treats that as "resend a fresh card".
+    pub async fn edit_message_text(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+        parse_mode: Option<&str>,
+        reply_markup: Option<&Value>,
+    ) -> reqwest::Result<()> {
+        let mut body = json!({ "chat_id": chat_id, "message_id": message_id, "text": text });
+        if let Some(parse_mode) = parse_mode {
+            body["parse_mode"] = json!(parse_mode);
+        }
+        if let Some(reply_markup) = reply_markup {
+            body["reply_markup"] = reply_markup.clone();
+        }
+        self.client
+            .post(self.url("editMessageText"))
             .json(&body)
             .send()
             .await
@@ -353,14 +393,28 @@ impl TelegramSender {
 
 #[async_trait]
 impl MessageSender for TelegramSender {
-    // Notifications go out HTML-formatted (format_event escapes the user-supplied label), no
-    // keyboard. The raising `-> None` becomes Result<(), SendError>: the reqwest error is
-    // boxed into notifier.rs's type-erased SendError (its contract for Notifier.dispatch's
-    // `except Exception`).
-    async fn send(&self, chat_id: i64, text: &str) -> std::result::Result<(), SendError> {
-        self.app
+    // Notifications go out HTML-formatted (format_card escapes the user-supplied label), no
+    // keyboard. reqwest errors box into notifier.rs's type-erased SendError (its contract for
+    // Notifier.dispatch's `except Exception`).
+    async fn send(&self, chat_id: i64, text: &str) -> std::result::Result<i64, SendError> {
+        Ok(self
+            .app
             .bot()
             .send_message(chat_id, text, Some(PARSE_MODE_HTML), None)
+            .await?)
+    }
+
+    // Edit the live card in place (same HTML formatting, no keyboard) — the silent per-fill
+    // update that replaces sending a new message each time.
+    async fn edit(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+    ) -> std::result::Result<(), SendError> {
+        self.app
+            .bot()
+            .edit_message_text(chat_id, message_id, text, Some(PARSE_MODE_HTML), None)
             .await?;
         Ok(())
     }

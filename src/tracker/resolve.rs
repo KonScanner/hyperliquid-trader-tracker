@@ -42,6 +42,9 @@ pub struct ResolvedFill {
     pub delta: Decimal,
     pub px: Decimal,
     pub ts: DateTime<Utc>,
+    /// The trade's on-chain tx hash (`WsTrade.hash`), carried through so a notification can
+    /// link the fill on the Hyperliquid explorer. `None` when the trade omits it or it is blank.
+    pub hash: Option<String>,
 }
 
 /// Extract the perp coin names from a Hyperliquid `meta` response's `universe`.
@@ -163,6 +166,13 @@ pub fn resolve_deltas(trade: &Value, watchlist: &HashSet<String>) -> Vec<Resolve
             ts
         }
     };
+    // The on-chain tx hash (`WsTrade.hash`) — threaded onto each resolved fill so a
+    // notification can link it on the explorer. A missing/blank hash simply yields no link.
+    let hash = trade
+        .get("hash")
+        .and_then(Value::as_str)
+        .filter(|h| !h.is_empty())
+        .map(str::to_string);
     // `str(users[0]).lower()` — see py_str; .lower() → to_lowercase (both Unicode-aware).
     let buyer = py_str(&users[0]).to_lowercase();
     let seller = py_str(&users[1]).to_lowercase();
@@ -174,6 +184,7 @@ pub fn resolve_deltas(trade: &Value, watchlist: &HashSet<String>) -> Vec<Resolve
             delta: sz,
             px,
             ts,
+            hash: hash.clone(),
         });
     }
     if watchlist.contains(seller.as_str()) {
@@ -183,6 +194,7 @@ pub fn resolve_deltas(trade: &Value, watchlist: &HashSet<String>) -> Vec<Resolve
             delta: -sz,
             px,
             ts,
+            hash,
         });
     }
     fills
@@ -306,6 +318,22 @@ mod tests {
         assert_eq!(
             fills.iter().map(|f| f.address.as_str()).collect::<Vec<_>>(),
             vec!["0xbuyer"]
+        );
+    }
+
+    #[test]
+    fn test_hash_is_threaded_onto_each_resolved_fill() {
+        let fills = resolve_deltas(&trade_with("hash", json!("0xabc123")), &watch());
+        assert_eq!(fills.len(), 2);
+        assert!(fills.iter().all(|f| f.hash.as_deref() == Some("0xabc123")));
+        // a blank hash carries through as None (no link)
+        let blank = resolve_deltas(&trade_with("hash", json!("")), &watch());
+        assert!(blank.iter().all(|f| f.hash.is_none()));
+        // an absent hash likewise
+        assert!(
+            resolve_deltas(&trade(), &watch())
+                .iter()
+                .all(|f| f.hash.is_none())
         );
     }
 

@@ -32,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 use crate::book::{InMemoryBook, SeenTids};
 use crate::config::Settings;
 use crate::hl_client::InfoClient;
-use crate::notifier::Notifier;
+use crate::notifier::{EventContext, Notifier};
 use crate::pnl::{ClosedPnlResolver, with_authoritative_pnl};
 use crate::registry::Registry;
 use crate::resolve::{perp_coins_from_meta, resolve_deltas};
@@ -414,9 +414,17 @@ impl Listener {
                     // PORT NOTE: `self._marks.get(event.coin)` returned Decimal | None →
                     // copied() Option<Decimal> (Decimal is Copy).
                     let mark = self.marks.get(&event.coin).copied();
-                    self.notifier
-                        .dispatch(&event, &recipients, leverage, mark)
-                        .await;
+                    // The card carries the fill's tx hash (for a View TX link) and, on a
+                    // close, the completed round-trip (entry/exit/PnL/duration). The notifier
+                    // edits this subscriber-set's live card in place instead of sending anew.
+                    let ctx = EventContext {
+                        event: &event,
+                        leverage,
+                        mark,
+                        tx_hash: fill.hash.as_deref(),
+                        trade: result.closed_trade.as_ref(),
+                    };
+                    self.notifier.dispatch(&ctx, &recipients).await;
                 }
             }
         }

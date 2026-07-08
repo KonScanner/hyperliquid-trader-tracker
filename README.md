@@ -29,12 +29,34 @@ started is correctly reported as *"Added to position"*, never a false *"Started 
 
 ## Notifications
 
+Instead of one message per fill, the bot keeps **one message per position** and **edits it in
+place** as the wallet opens → adds → reduces → closes. Editing is silent (no notification ping),
+so a card stays current without spamming the chat. Every card leads with your label, shows the
+current position, and carries a copyable full address, a **View TX** explorer link, and the fill
+time. An open:
+
 ```
-🟢 Started trade Whale-1: BTC Long 2.5 @ 63120 (10x)
-➕ Added to position Whale-1: BTC Long +1 (~$63,120.00) @ 63120 (10x)
-➖ Reduced Whale-1: BTC Long -0.5 @ 64000 | realized +$440.00 | 2 left
-🔴 Closed Whale-1: BTC Long 2 @ 64500 | realized +$2,760.00
+🟢 Whale-1 · BTC Long 10x
+Opened 2.5 @ 63120 (≈$157,800)
+👤 0xabc…def
+🔗 View TX · 🕒 12:00 UTC
 ```
+
+…is the *same message*, edited, once the wallet closes:
+
+```
+🔴 Whale-1 · BTC Long 10x
+Closed 2 · 63120 → 64500
+💰 +$2,760.00 (+21.9%) · held 3h12m
+👤 0xabc…def
+🔗 View TX · 🕒 15:12 UTC
+```
+
+Adds show a running total (`Added +1 @ 63120 → 3 total (≈$189,360)`) and reduces show the realized
+PnL and remaining size (`Reduced -0.5 @ 64000 → 2 left · realized +$440.00`). The `+21.9%` on a
+close is the leveraged return on margin (shown when leverage is known). Set
+`TRACKER_NOTIFY_REDUCE_CLOSE=false` to suppress the *new* pings for reduces/closes — the card is
+still edited silently so it never goes stale.
 
 ## Credentials — what you need and how to get it
 
