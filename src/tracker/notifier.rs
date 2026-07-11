@@ -19,10 +19,11 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use chrono::Timelike;
+use chrono::{DateTime, Timelike, Utc};
 use rust_decimal::Decimal;
+use serde_json::{Value, json};
 
-use crate::models::CompletedTrade;
+use crate::models::{AccountPosition, CompletedTrade};
 // PORT NOTE: the EVENT_* str constants arrive as the EventKind enum (state.rs fixed decision);
 // equality/membership tests become `==` / `matches!` on variants.
 use crate::state::{EventKind, LiveEvent};
@@ -48,10 +49,22 @@ pub type SendError = Box<dyn std::error::Error + Send + Sync>;
 // place instead of sending a new message per fill.
 #[async_trait]
 pub trait MessageSender: Send + Sync {
-    /// Deliver a new message; returns its id so a later fill can edit it in place.
-    async fn send(&self, chat_id: i64, text: &str) -> Result<i64, SendError>;
+    /// Deliver a new message; returns its id so a later fill can edit it in place. `reply_markup`
+    /// carries the optional inline keyboard (the 🔄 Update P&L button on live-position cards).
+    async fn send(
+        &self,
+        chat_id: i64,
+        text: &str,
+        reply_markup: Option<&Value>,
+    ) -> Result<i64, SendError>;
     /// Edit a previously-sent message in place (a silent update — it never pings the user).
-    async fn edit(&self, chat_id: i64, message_id: i64, text: &str) -> Result<(), SendError>;
+    async fn edit(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+        reply_markup: Option<&Value>,
+    ) -> Result<(), SendError>;
 }
 
 /// Render a Decimal without trailing zeros or scientific notation (``2.50`` -> ``2.5``).
@@ -62,6 +75,18 @@ pub trait MessageSender: Send + Sync {
 // lands on the same text.
 pub(crate) fn trim(d: Decimal) -> String {
     d.normalize().to_string()
+}
+
+/// Group an unsigned integer-part string into thousands: `"63120"` -> `"63,120"`.
+fn group_int(int_part: &str) -> String {
+    let mut grouped = String::with_capacity(int_part.len() + int_part.len() / 3);
+    for (i, ch) in int_part.chars().enumerate() {
+        if i > 0 && (int_part.len() - i).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(ch);
+    }
+    grouped
 }
 
 /// Thousands-grouped fixed-point, i.e. Python's ``f"{value:,.{dp}f}"``.
@@ -77,30 +102,60 @@ pub(crate) fn comma(d: Decimal, dp: u32) -> String {
         Some((int_part, frac_part)) => (int_part, Some(frac_part)),
         None => (unsigned.as_str(), None),
     };
-    let mut grouped = String::with_capacity(int_part.len() + int_part.len() / 3);
-    for (i, ch) in int_part.chars().enumerate() {
-        if i > 0 && (int_part.len() - i) % 3 == 0 {
-            grouped.push(',');
-        }
-        grouped.push(ch);
-    }
     let sign = if rounded.is_sign_negative() { "-" } else { "" };
     match frac_part {
-        Some(frac_part) => format!("{sign}{grouped}.{frac_part}"),
-        None => format!("{sign}{grouped}"),
+        Some(frac_part) => format!("{sign}{}.{frac_part}", group_int(int_part)),
+        None => format!("{sign}{}", group_int(int_part)),
     }
 }
 
-/// Signed USD PnL, e.g. ``+$2,760.00`` / ``-$440.00``; ``?`` when unknown.
-// PORT NOTE: `_pnl` → `pnl` (underscore dropped). `Decimal | None` → Option<Decimal>
-// (Decimal is Copy, so by value). `d >= 0` holds for Decimal("-0") in both languages
-// (compares equal to zero) → "+".
-pub(crate) fn pnl(d: Option<Decimal>) -> String {
+/// A price with its integer part thousands-grouped but full precision kept: `1.6444` stays
+/// `1.6444`, `63120` becomes `63,120`. Unlike [`comma`] it never rounds — a price is a number a
+/// user may want exact, so only the grouping is cosmetic.
+pub(crate) fn money_px(px: Decimal) -> String {
+    let s = trim(px.abs());
+    let (int_part, frac) = match s.split_once('.') {
+        Some((int_part, frac)) => (int_part, Some(frac)),
+        None => (s.as_str(), None),
+    };
+    let sign = if px.is_sign_negative() { "-" } else { "" };
+    match frac {
+        Some(frac) => format!("{sign}{}.{frac}", group_int(int_part)),
+        None => format!("{sign}{}", group_int(int_part)),
+    }
+}
+
+/// Abbreviate a magnitude for the *scanned* notional: `834`, `157.8k`, `1.2M`. The exact figure
+/// is never the copyable one (sizes and prices stay full-precision), so 1-dp is safe here.
+pub(crate) fn notional_short(v: Decimal) -> String {
+    let v = v.abs();
+    let k = Decimal::from(1_000);
+    let m = Decimal::from(1_000_000);
+    if v < k {
+        comma(v, 0)
+    } else if v < m {
+        format!("{}k", (v / k).round_dp(1).normalize())
+    } else {
+        format!("{}M", (v / m).round_dp(1).normalize())
+    }
+}
+
+/// Signed, abbreviated dollar figure for aggregates, e.g. `+$3.1k`, `-$320`, `+$1.2M`.
+pub(crate) fn money_short(d: Decimal) -> String {
+    let sign = if d.is_sign_negative() { "-" } else { "+" };
+    format!("{sign}${}", notional_short(d.abs()))
+}
+
+/// Signed whole-dollar PnL, thousands-grouped: `+$1,329`, `-$320`; `?` when unknown. The card
+/// grids favour whole dollars over cents — the leader's realized figure reads as a headline, and
+/// the exact value is one tap away on the TX.
+// PORT NOTE: `d >= 0` holds for Decimal("-0") (compares equal to zero) → "+".
+pub(crate) fn pnl_whole(d: Option<Decimal>) -> String {
     let Some(d) = d else {
         return "?".to_string();
     };
     let sign = if d >= Decimal::ZERO { "+" } else { "-" };
-    format!("{sign}${}", comma(d.abs(), 2))
+    format!("{sign}${}", comma(d.abs(), 0))
 }
 
 /// Escape user-supplied text before it goes into an HTML-parsed message.
@@ -118,6 +173,26 @@ pub(crate) fn escape_html(s: &str) -> String {
 /// Base URL of the Hyperliquid (HyperCore) explorer — public trades land here, not on HyperEVM.
 const EXPLORER_TX: &str = "https://app.hyperliquid.xyz/explorer/tx/";
 
+/// Explorer address page — the trader name links here, so a card needs no raw-address line.
+pub(crate) const EXPLORER_ADDR: &str = "https://app.hyperliquid.xyz/explorer/address/";
+
+/// The bold, tap-through trader name used in every card header:
+/// `<b><a href="…/address/{addr}">{label}</a></b>`. Both arguments are HTML-escaped (the label is
+/// user-supplied; the address is hex but escaped for uniformity). Shared by `format_card`,
+/// `format_live_position`, and the bot's `/positions` view so the header markup lives in one place.
+pub(crate) fn linked_name(address: &str, label: &str) -> String {
+    format!(
+        "<b><a href=\"{EXPLORER_ADDR}{}\">{}</a></b>",
+        escape_html(address),
+        escape_html(label)
+    )
+}
+
+/// A card's `HH:MM UTC` meta stamp.
+fn hhmm_utc(dt: DateTime<Utc>) -> String {
+    format!("{:02}:{:02} UTC", dt.hour(), dt.minute())
+}
+
 /// Everything needed to render + route one lifecycle card, minus the per-recipient label.
 ///
 /// Built once per event by the listener and rendered per subscriber (each with their own label).
@@ -131,139 +206,315 @@ pub struct EventContext<'a> {
     pub tx_hash: Option<&'a str>,
     /// The completed round-trip on a close/flip — entry/exit/size/duration for the close card.
     pub trade: Option<&'a CompletedTrade>,
+    /// Blended average entry of the currently-open leg, when known — drives the ENTRY row on an
+    /// add and the ROI on a reduce (a reduce books PnL against this basis, not the fill price).
+    pub avg_entry: Option<Decimal>,
 }
 
-/// Render one lifecycle event as a compact, position-aware HTML card.
+/// A key/value row in a card's monospace grid: an 8-wide label column, then the value. Eight is
+/// the widest label used (`NOTIONAL`, `REALIZED`), so every value lands on the same edge.
+fn row(label: &str, value: &str) -> String {
+    format!("{label:<8} {value}")
+}
+
+/// Render one lifecycle event as a compact, terminal-style HTML card.
 ///
 /// The listener keeps ONE message per `(chat, wallet, coin)` lifecycle and edits it in place as
 /// fills arrive, so this same renderer produces the open card, each add/reduce update, and the
-/// final closed card. Line 1 is the header (label · coin · direction · leverage); line 2 is the
-/// action + resulting position; the footer carries the copyable full address, a View TX link,
-/// and the fill time. The subscriber's label is user-supplied and HTML-escaped; the sender must
-/// deliver with `parse_mode=HTML` (bot.rs's TelegramSender does).
+/// final closed card. Line 1 is the header (linked trader name · coin · direction · leverage); a
+/// monospace `<pre>` grid aligns the numbers a copy-trader acts on; the meta line carries a
+/// View TX link and the fill time. The trader name links to the wallet's explorer page, so the
+/// raw address needs no line of its own. The subscriber's label is user-supplied and
+/// HTML-escaped; the sender must deliver with `parse_mode=HTML` (bot.rs's TelegramSender does).
 // PORT NOTE: this has moved well past the Python `format_event` two-liner — see the module doc.
 pub fn format_card(ctx: &EventContext<'_>, label: &str) -> String {
     let event = ctx.event;
     let lev = ctx.leverage.map(|l| format!(" {l}x")).unwrap_or_default();
-    let label = escape_html(label);
     let coin = escape_html(&event.coin);
-    let direction = event.direction;
-    let px = trim(event.px);
+    // Header side is upper-cased ("LONG"/"SHORT") for the terminal look; Display gives "Long".
+    let dir = event.direction.to_string().to_uppercase();
     // Notional uses the live mark when we have it, else the fill price (a close approximation
     // until the first allMids tick lands).
     let mark = ctx.mark.unwrap_or(event.px);
+    let size = trim(event.szi_after.abs());
+    let notional = notional_short(event.szi_after.abs() * mark);
 
-    let (emoji, body) = match event.kind {
-        EventKind::Open => {
-            let size = trim(event.szi_after.abs());
-            let notional = comma(event.szi_after.abs() * mark, 0);
-            ("🟢", format!("Opened {size} @ {px} (≈${notional})"))
-        }
+    let (emoji, mut rows) = match event.kind {
+        EventKind::Open => (
+            "🟢",
+            vec![
+                row("ENTRY", &format!("${}", money_px(event.px))),
+                row("SIZE", &format!("{size} {coin}")),
+                row("NOTIONAL", &format!("${notional}")),
+            ],
+        ),
         EventKind::Add => {
             let added = trim(event.delta.abs());
-            let total = trim(event.szi_after.abs());
-            let notional = comma(event.szi_after.abs() * mark, 0);
-            (
-                "➕",
-                format!("Added +{added} @ {px} → {total} total (≈${notional})"),
-            )
+            let pct = pct_of_position(event.delta, event.szi_after, "+")
+                .map(|p| format!("  {p}"))
+                .unwrap_or_default();
+            let mut rows = vec![
+                row("ADDED", &format!("+{added} {coin}{pct}")),
+                row("FILL", &format!("${}", money_px(event.px))),
+                row("SIZE", &format!("{size} {coin}")),
+            ];
+            // Blended basis after scaling in — only when the listener plumbed it through.
+            if let Some(entry) = ctx.avg_entry {
+                rows.push(row("ENTRY", &format!("${}", money_px(entry))));
+            }
+            rows.push(row("NOTIONAL", &format!("${notional}")));
+            ("➕", rows)
         }
         EventKind::Reduce => {
             let reduced = trim(event.delta.abs());
-            let left = trim(event.szi_after.abs());
-            (
-                "➖",
-                format!(
-                    "Reduced -{reduced} @ {px} → {left} left · realized {}",
-                    pnl(event.realized_pnl)
-                ),
-            )
+            let pct = pct_of_position(event.delta, event.szi_after, "-")
+                .map(|p| format!("  {p}"))
+                .unwrap_or_default();
+            // ROI on a reduce is booked against the reduced slice's entry notional.
+            let entry_notional = ctx.avg_entry.map(|e| event.delta.abs() * e);
+            let mut rows = vec![
+                row("REDUCED", &format!("-{reduced} {coin}{pct}")),
+                row("FILL", &format!("${}", money_px(event.px))),
+                row("REALIZED", &pnl_whole(event.realized_pnl)),
+            ];
+            if let Some(roi) = roi_on_margin(event.realized_pnl, entry_notional, ctx.leverage) {
+                rows.push(row("ROI", &roi));
+            }
+            rows.push(row("SIZE", &format!("{size} left")));
+            rows.push(row("NOTIONAL", &format!("${notional}")));
+            ("➖", rows)
         }
-        EventKind::Close => ("🔴", format_close_body(ctx, &px)),
+        EventKind::Close => ("🔴", close_rows(ctx, &coin)),
     };
 
-    let header = format!("{emoji} <b>{label}</b> · <b>{coin}</b> {direction}{lev}");
-    // The full address in <code> is tap-to-copy (a truncated 0x…abcd form would copy the
-    // ellipsis, not a usable address — the same reasoning as the /list and /positions views).
-    let mut footer = format!("👤 <code>{}</code>", escape_html(&event.address));
-    let time = format!("{:02}:{:02} UTC", event.ts.hour(), event.ts.minute());
-    match ctx.tx_hash {
-        Some(hash) if !hash.is_empty() => footer.push_str(&format!(
-            "\n🔗 <a href=\"{EXPLORER_TX}{}\">View TX</a> · 🕒 {time}",
-            escape_html(hash)
-        )),
-        _ => footer.push_str(&format!("\n🕒 {time}")),
+    // Live uPnL on the still-open size, from the current mark — frozen at send time, refreshed
+    // live by the 🔄 Update button. A close shows realized PnL instead, so it gets no uPnL row.
+    if event.kind != EventKind::Close
+        && let Some(upnl) = unrealized(ctx.mark, ctx.avg_entry, event.szi_after)
+    {
+        rows.push(row("uPNL", &pnl_whole(Some(upnl))));
     }
-    format!("{header}\n{body}\n{footer}")
+
+    let header = format!(
+        "{emoji} {} · {coin} {dir}{lev}",
+        linked_name(&event.address, label)
+    );
+    // Emojis stay OUT of the <pre> — inside a monospace block many clients render them ~2 cells
+    // wide, which would shear the column the whole design depends on.
+    let grid = format!("<pre>{}</pre>", rows.join("\n"));
+    let time = hhmm_utc(event.ts);
+    let meta = match ctx.tx_hash {
+        Some(hash) if !hash.is_empty() => format!(
+            "🔗 <a href=\"{EXPLORER_TX}{}\">TX</a> · 🕒 {time}",
+            escape_html(hash)
+        ),
+        _ => format!("🕒 {time}"),
+    };
+    format!("{header}\n{grid}\n{meta}")
 }
 
-/// The two body lines of a closed-position card: `Closed {size} · {entry} → {exit}` and a
-/// PnL / ROI / holding-time line. Entry/exit/size/duration come from the completed round-trip;
-/// the money figure is the event's realized PnL (which the listener may have replaced with the
-/// exchange's authoritative `closedPnl`).
-fn format_close_body(ctx: &EventContext<'_>, fill_px: &str) -> String {
+/// The rows of a closed-position card: SIZE / ENTRY / EXIT / NET P/L / ROI / HELD. Entry, exit,
+/// size and duration come from the completed round-trip; the money figure is the event's
+/// realized PnL (which the listener may have replaced with the exchange's authoritative
+/// `closedPnl`). Keeping SIZE here means a scroll-back reader still sees how big the leg was.
+fn close_rows(ctx: &EventContext<'_>, coin: &str) -> Vec<String> {
     let event = ctx.event;
-    let (entry, exit, size, held) = match ctx.trade {
+    let fill = money_px(event.px);
+    let (size, entry, exit, held, entry_notional) = match ctx.trade {
         Some(trade) => (
-            trade
-                .avg_entry_px
-                .map(trim)
-                .unwrap_or_else(|| fill_px.to_string()),
-            trade
-                .avg_exit_px
-                .map(trim)
-                .unwrap_or_else(|| fill_px.to_string()),
             trade
                 .size
                 .map(|s| trim(s.abs()))
                 .unwrap_or_else(|| trim(event.delta.abs())),
-            fmt_duration(trade.duration_mins),
+            trade
+                .avg_entry_px
+                .map(money_px)
+                .unwrap_or_else(|| fill.clone()),
+            trade
+                .avg_exit_px
+                .map(money_px)
+                .unwrap_or_else(|| fill.clone()),
+            Some(fmt_duration(trade.duration_mins)),
+            match (trade.size, trade.avg_entry_px) {
+                (Some(s), Some(e)) => Some(s.abs() * e),
+                _ => None,
+            },
         ),
         None => (
-            fill_px.to_string(),
-            fill_px.to_string(),
             trim(event.delta.abs()),
-            String::new(),
+            fill.clone(),
+            fill.clone(),
+            None,
+            None,
         ),
     };
-    let money = event.realized_pnl;
-    let up = money.map(|m| m >= Decimal::ZERO).unwrap_or(true);
-    let money_emoji = if up { "💰" } else { "🔻" };
-    let roi = close_roi(money, ctx.trade, ctx.leverage);
-    let held = if held.is_empty() {
-        String::new()
-    } else {
-        format!(" · held {held}")
-    };
-    format!(
-        "Closed {size} · {entry} → {exit}\n{money_emoji} {}{roi}{held}",
-        pnl(money)
-    )
+    let mut rows = vec![
+        row("SIZE", &format!("{size} {coin}")),
+        row("ENTRY", &format!("${entry}")),
+        row("EXIT", &format!("${exit}")),
+        row("NET P/L", &pnl_whole(event.realized_pnl)),
+    ];
+    if let Some(roi) = roi_on_margin(event.realized_pnl, entry_notional, ctx.leverage) {
+        rows.push(row("ROI", &roi));
+    }
+    if let Some(held) = held {
+        rows.push(row("HELD", &held));
+    }
+    rows
 }
 
-/// Leveraged return on margin as a signed percentage suffix, e.g. `" (+21.9%)"`; `""` when it
-/// can't be computed (unknown leverage, missing size/entry, or a zero-notional leg).
-fn close_roi(
+/// The signed fraction of the prior position this fill added or removed, e.g. `"+40%"` /
+/// `"-43%"`; `None` when the prior size is unknown/zero (so a bare or NaN `%` never prints). The
+/// caller passes the sign (`"+"` on an add, `"-"` on a reduce) because a short scales the same
+/// way a long does — the delta's own sign tracks side, not grow-vs-shrink.
+fn pct_of_position(delta: Decimal, szi_after: Decimal, sign: &str) -> Option<String> {
+    let prior = szi_after - delta;
+    if prior.is_zero() {
+        return None;
+    }
+    let pct = (delta.abs() / prior.abs() * Decimal::from(100)).round_dp(0);
+    Some(format!("{sign}{}%", pct.normalize()))
+}
+
+/// Leveraged return on margin as a signed percentage, e.g. `"+21.9%"`; `None` when it can't be
+/// computed (unknown leverage/entry, or a zero-notional leg). Shared by reduces (booked against
+/// the reduced slice's entry notional) and closes (against the whole leg's).
+fn roi_on_margin(
     pnl: Option<Decimal>,
-    trade: Option<&CompletedTrade>,
+    entry_notional: Option<Decimal>,
     leverage: Option<i64>,
-) -> String {
-    let (Some(pnl), Some(trade), Some(lev)) = (pnl, trade, leverage) else {
-        return String::new();
-    };
-    let (Some(size), Some(entry)) = (trade.size, trade.avg_entry_px) else {
-        return String::new();
-    };
-    let entry_notional = size.abs() * entry;
+) -> Option<String> {
+    let (pnl, entry_notional, lev) = (pnl?, entry_notional?, leverage?);
     if entry_notional.is_zero() || lev <= 0 {
-        return String::new();
+        return None;
     }
     // ROI on margin = price move × leverage = (pnl / entry_notional) × leverage.
     let roi = (pnl / entry_notional * Decimal::from(lev) * Decimal::from(100)).round_dp(1);
     let roi = roi.normalize();
     // A negative value already prints its own '-', so only the non-negative case needs a sign.
     let sign = if roi.is_sign_negative() { "" } else { "+" };
-    format!(" ({sign}{roi}%)")
+    Some(format!("{sign}{roi}%"))
+}
+
+/// Unrealized PnL on the still-open size = (mark − entry) × signed size. `None` unless both the
+/// live mark and the blended entry are known, so an un-marked coin never shows a fake $0.
+fn unrealized(
+    mark: Option<Decimal>,
+    avg_entry: Option<Decimal>,
+    szi_after: Decimal,
+) -> Option<Decimal> {
+    Some((mark? - avg_entry?) * szi_after)
+}
+
+/// The 🔄 Update P&L inline keyboard for a live-position card, or `None` when the callback payload
+/// `upnl:{address}:{coin}` would exceed Telegram's 64-byte limit (a very long HIP-3 coin symbol).
+/// The bot re-fetches that wallet's clearinghouse snapshot on tap and edits the card in place with
+/// fresh uPnL/ROI + the liquidation price. Kept here so the dispatch path and the bot's callback
+/// handler build an identical button. Returning `None` lets the caller send a button-less card
+/// rather than have the Bot API reject the whole message.
+pub(crate) fn update_pnl_keyboard(address: &str, coin: &str) -> Option<Value> {
+    let data = format!("upnl:{address}:{coin}");
+    (data.len() <= 64).then(|| {
+        json!({
+            "inline_keyboard": [[{
+                "text": "🔄 Update P&L",
+                "callback_data": data,
+            }]]
+        })
+    })
+}
+
+/// Round a derived price to a magnitude-appropriate precision (a mark implied by value/size can
+/// carry a long fractional tail): whole dollars ≥ $1k, cents ≥ $1, six places below.
+fn round_price(px: Decimal) -> Decimal {
+    let a = px.abs();
+    if a >= Decimal::from(1000) {
+        px.round_dp(0)
+    } else if a >= Decimal::ONE {
+        px.round_dp(2)
+    } else {
+        px.round_dp(6)
+    }
+}
+
+/// Signed distance from the mark to the liquidation price: `"-10.7%"` (liq below, a long) /
+/// `"+8.2%"` (liq above, a short). `None` when the mark is zero.
+fn liq_distance(mark: Decimal, liq: Decimal) -> Option<String> {
+    if mark.is_zero() {
+        return None;
+    }
+    let pct = ((liq - mark) / mark * Decimal::from(100))
+        .round_dp(1)
+        .normalize();
+    let sign = if pct.is_sign_negative() { "" } else { "+" };
+    Some(format!("{sign}{pct}%"))
+}
+
+/// Render a wallet's CURRENT state in one coin as a live TAPE snapshot — the 🔄 Update button's
+/// target. Unlike [`format_card`] (which narrates a fill), this is a point-in-time clearinghouse
+/// read: size, entry, mark, notional, uPnL (+ margin ROI), and the liquidation price + distance.
+/// The caller re-attaches [`update_pnl_keyboard`] so the card can be refreshed again.
+pub(crate) fn format_live_position(
+    label: &str,
+    address: &str,
+    p: &AccountPosition,
+    now: DateTime<Utc>,
+) -> String {
+    let coin = escape_html(&p.coin);
+    let szi = p.szi.unwrap_or_default();
+    let (emoji, dir) = if szi < Decimal::ZERO {
+        ("🔴", "SHORT")
+    } else {
+        ("🟢", "LONG")
+    };
+    let lev = p
+        .leverage_value
+        .map(|l| format!(" {l}x"))
+        .unwrap_or_default();
+
+    // Mark is implied by notional / size (positionValue = |size| × mark).
+    let mark = match (p.position_value, p.szi) {
+        (Some(v), Some(s)) if !s.is_zero() => Some(round_price(v.abs() / s.abs())),
+        _ => None,
+    };
+    let entry_notional = match (p.szi, p.entry_px) {
+        (Some(s), Some(e)) => Some(s.abs() * e),
+        _ => None,
+    };
+
+    let mut rows = vec![row("SIZE", &format!("{} {coin}", trim(szi.abs())))];
+    if let Some(entry) = p.entry_px {
+        rows.push(row("ENTRY", &format!("${}", money_px(entry))));
+    }
+    if let Some(m) = mark {
+        rows.push(row("MARK", &format!("${}", money_px(m))));
+    }
+    if let Some(v) = p.position_value {
+        rows.push(row("NOTIONAL", &format!("${}", notional_short(v.abs()))));
+    }
+    if let Some(upnl) = p.unrealized_pnl {
+        let roi = roi_on_margin(Some(upnl), entry_notional, p.leverage_value)
+            .map(|r| format!("  ({r})"))
+            .unwrap_or_default();
+        rows.push(row("uPNL", &format!("{}{roi}", pnl_whole(Some(upnl)))));
+    }
+    if let Some(liq) = p.liquidation_px {
+        let dist = mark
+            .and_then(|m| liq_distance(m, liq))
+            .map(|d| format!("  {d}"))
+            .unwrap_or_default();
+        rows.push(row("LIQ", &format!("${}{dist}", money_px(liq))));
+    }
+
+    let header = format!(
+        "{emoji} {} · {coin} {dir}{lev}",
+        linked_name(address, label)
+    );
+    let time = hhmm_utc(now);
+    format!(
+        "{header}\n<pre>{}</pre>\n🕒 {time} · updated",
+        rows.join("\n")
+    )
 }
 
 /// Compact holding time: `45m`, `3h12m`, `2d3h`.
@@ -291,13 +542,24 @@ pub struct LoggingSender {
 
 #[async_trait]
 impl MessageSender for LoggingSender {
-    async fn send(&self, chat_id: i64, text: &str) -> Result<i64, SendError> {
+    async fn send(
+        &self,
+        chat_id: i64,
+        text: &str,
+        _reply_markup: Option<&Value>,
+    ) -> Result<i64, SendError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         tracing::info!("NOTIFY chat={chat_id} (new msg {id}): {text}");
         Ok(id)
     }
 
-    async fn edit(&self, chat_id: i64, message_id: i64, text: &str) -> Result<(), SendError> {
+    async fn edit(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+        _reply_markup: Option<&Value>,
+    ) -> Result<(), SendError> {
         tracing::info!("NOTIFY chat={chat_id} (edit msg {message_id}): {text}");
         Ok(())
     }
@@ -344,11 +606,25 @@ impl Notifier {
             EventKind::Open | EventKind::Add => true,
             EventKind::Reduce | EventKind::Close => self.notify_reduce_close,
         };
+        // Every still-open card carries the 🔄 Update P&L button (same for all recipients — the
+        // callback keys on wallet+coin, not the chat); a close finalizes the card with no button.
+        // `update_pnl_keyboard` returns None if the payload would overflow 64 bytes → button-less.
+        let keyboard = match event.kind {
+            EventKind::Close => None,
+            _ => update_pnl_keyboard(&event.address, &event.coin),
+        };
         for (chat_id, label) in recipients {
             let text = format_card(ctx, label);
             let key = (*chat_id, event.address.clone(), event.coin.clone());
-            self.deliver(*chat_id, &key, event.kind, &text, can_create_new)
-                .await;
+            self.deliver(
+                *chat_id,
+                &key,
+                event.kind,
+                &text,
+                keyboard.as_ref(),
+                can_create_new,
+            )
+            .await;
         }
     }
 
@@ -363,11 +639,13 @@ impl Notifier {
         key: &(i64, String, String),
         kind: EventKind,
         text: &str,
+        reply_markup: Option<&Value>,
         can_create_new: bool,
     ) {
         // An open always starts a fresh card — any stale id for this (wallet, coin) is replaced.
         if kind == EventKind::Open {
-            self.send_and_track(chat_id, key, kind, text).await;
+            self.send_and_track(chat_id, key, kind, text, reply_markup)
+                .await;
             return;
         }
 
@@ -379,7 +657,11 @@ impl Notifier {
             .copied();
 
         if let Some(message_id) = existing {
-            match self.sender.edit(chat_id, message_id, text).await {
+            match self
+                .sender
+                .edit(chat_id, message_id, text, reply_markup)
+                .await
+            {
                 // The lifecycle ended — forget the card so the next open starts clean.
                 Ok(()) if kind == EventKind::Close => {
                     self.cards.lock().expect("cards mutex poisoned").remove(key);
@@ -391,7 +673,8 @@ impl Notifier {
                     self.cards.lock().expect("cards mutex poisoned").remove(key);
                     tracing::warn!("card edit failed (chat={chat_id} msg={message_id}): {err}");
                     if can_create_new {
-                        self.send_and_track(chat_id, key, kind, text).await;
+                        self.send_and_track(chat_id, key, kind, text, reply_markup)
+                            .await;
                     }
                 }
             }
@@ -401,7 +684,8 @@ impl Notifier {
         // No live card to edit. Create one only when allowed — muting exits suppresses a *new*
         // reduce/close message (which would ping), never the silent edit above.
         if can_create_new {
-            self.send_and_track(chat_id, key, kind, text).await;
+            self.send_and_track(chat_id, key, kind, text, reply_markup)
+                .await;
         }
     }
 
@@ -413,8 +697,9 @@ impl Notifier {
         key: &(i64, String, String),
         kind: EventKind,
         text: &str,
+        reply_markup: Option<&Value>,
     ) {
-        match self.sender.send(chat_id, text).await {
+        match self.sender.send(chat_id, text, reply_markup).await {
             Ok(message_id) => {
                 if kind != EventKind::Close {
                     self.cards
@@ -501,6 +786,8 @@ mod tests {
             mark,
             tx_hash,
             trade,
+            // Tests that exercise the ENTRY row / reduce-ROI set this field explicitly after.
+            avg_entry: None,
         }
     }
 
@@ -511,81 +798,109 @@ mod tests {
     // --- format_card (pure) -----------------------------------------------------------------
 
     #[test]
-    fn test_open_card_leads_with_label_shows_leverage_and_notional() {
+    fn test_open_card_links_name_and_renders_grid() {
         let e = event(EventKind::Open, "2.5", "2.5", None);
         let text = format_card(&ctx(&e, Some(10), None, None, None), "Whale-1");
         assert_eq!(
             text,
-            "🟢 <b>Whale-1</b> · <b>BTC</b> Long 10x\n\
-             Opened 2.5 @ 63120 (≈$157,800)\n\
-             👤 <code>0xa</code>\n\
+            "🟢 <b><a href=\"https://app.hyperliquid.xyz/explorer/address/0xa\">Whale-1</a></b> · BTC LONG 10x\n\
+             <pre>ENTRY    $63,120\n\
+             SIZE     2.5 BTC\n\
+             NOTIONAL $157.8k</pre>\n\
              🕒 12:00 UTC"
         );
     }
 
     #[test]
-    fn test_add_card_shows_running_total_and_tx_link() {
+    fn test_add_card_shows_pct_blended_entry_and_tx_link() {
         let e = event(EventKind::Add, "1", "3", None);
-        let text = format_card(
-            &ctx(&e, Some(10), Some(d("63120")), Some("0xdead"), None),
-            "W",
-        );
+        let mut c = ctx(&e, Some(10), Some(d("63120")), Some("0xdead"), None);
+        c.avg_entry = Some(d("62800"));
+        let text = format_card(&c, "W");
         assert_eq!(
             text,
-            "➕ <b>W</b> · <b>BTC</b> Long 10x\n\
-             Added +1 @ 63120 → 3 total (≈$189,360)\n\
-             👤 <code>0xa</code>\n\
-             🔗 <a href=\"https://app.hyperliquid.xyz/explorer/tx/0xdead\">View TX</a> · 🕒 12:00 UTC"
+            "➕ <b><a href=\"https://app.hyperliquid.xyz/explorer/address/0xa\">W</a></b> · BTC LONG 10x\n\
+             <pre>ADDED    +1 BTC  +50%\n\
+             FILL     $63,120\n\
+             SIZE     3 BTC\n\
+             ENTRY    $62,800\n\
+             NOTIONAL $189.4k\n\
+             uPNL     +$960</pre>\n\
+             🔗 <a href=\"https://app.hyperliquid.xyz/explorer/tx/0xdead\">TX</a> · 🕒 12:00 UTC"
         );
     }
 
     #[test]
-    fn test_add_card_without_mark_or_leverage_uses_fill_price_and_omits_leverage() {
+    fn test_add_card_without_mark_leverage_or_entry_degrades_gracefully() {
         let e = event(EventKind::Add, "1", "3", None);
         let text = format_card(&ctx(&e, None, None, None, None), "W");
         assert_eq!(
             text,
-            "➕ <b>W</b> · <b>BTC</b> Long\n\
-             Added +1 @ 63120 → 3 total (≈$189,360)\n\
-             👤 <code>0xa</code>\n\
+            "➕ <b><a href=\"https://app.hyperliquid.xyz/explorer/address/0xa\">W</a></b> · BTC LONG\n\
+             <pre>ADDED    +1 BTC  +50%\n\
+             FILL     $63,120\n\
+             SIZE     3 BTC\n\
+             NOTIONAL $189.4k</pre>\n\
              🕒 12:00 UTC"
         );
     }
 
     #[test]
-    fn test_reduce_card_shows_realized_and_remaining() {
+    fn test_reduce_card_shows_realized_roi_and_remaining_notional() {
         let e = event(EventKind::Reduce, "-0.5", "2", Some("440"));
-        let text = format_card(&ctx(&e, Some(10), None, None, None), "Whale-1");
+        let mut c = ctx(&e, Some(10), None, None, None);
+        c.avg_entry = Some(d("60000"));
+        let text = format_card(&c, "Whale-1");
         assert_eq!(
             text,
-            "➖ <b>Whale-1</b> · <b>BTC</b> Long 10x\n\
-             Reduced -0.5 @ 63120 → 2 left · realized +$440.00\n\
-             👤 <code>0xa</code>\n\
+            "➖ <b><a href=\"https://app.hyperliquid.xyz/explorer/address/0xa\">Whale-1</a></b> · BTC LONG 10x\n\
+             <pre>REDUCED  -0.5 BTC  -20%\n\
+             FILL     $63,120\n\
+             REALIZED +$440\n\
+             ROI      +14.7%\n\
+             SIZE     2 left\n\
+             NOTIONAL $126.2k</pre>\n\
              🕒 12:00 UTC"
         );
     }
 
     #[test]
-    fn test_close_card_shows_entry_exit_pnl_roi_and_duration() {
+    fn test_reduce_card_omits_roi_without_leverage() {
+        let e = event(EventKind::Reduce, "-0.5", "2", Some("440"));
+        let mut c = ctx(&e, None, None, None, None);
+        c.avg_entry = Some(d("60000"));
+        let text = format_card(&c, "W");
+        assert!(text.contains("REALIZED +$440"), "{text}");
+        assert!(!text.contains("ROI"), "{text}");
+    }
+
+    #[test]
+    fn test_close_card_shows_size_entry_exit_pnl_roi_and_duration() {
         let e = event(EventKind::Close, "-2", "0", Some("2760"));
         let t = trade("2", "63120", "64500", 192, "2760");
         let text = format_card(&ctx(&e, Some(10), None, Some("0xbeef"), Some(&t)), "W");
         assert_eq!(
             text,
-            "🔴 <b>W</b> · <b>BTC</b> Long 10x\n\
-             Closed 2 · 63120 → 64500\n\
-             💰 +$2,760.00 (+21.9%) · held 3h12m\n\
-             👤 <code>0xa</code>\n\
-             🔗 <a href=\"https://app.hyperliquid.xyz/explorer/tx/0xbeef\">View TX</a> · 🕒 12:00 UTC"
+            "🔴 <b><a href=\"https://app.hyperliquid.xyz/explorer/address/0xa\">W</a></b> · BTC LONG 10x\n\
+             <pre>SIZE     2 BTC\n\
+             ENTRY    $63,120\n\
+             EXIT     $64,500\n\
+             NET P/L  +$2,760\n\
+             ROI      +21.9%\n\
+             HELD     3h12m</pre>\n\
+             🔗 <a href=\"https://app.hyperliquid.xyz/explorer/tx/0xbeef\">TX</a> · 🕒 12:00 UTC"
         );
     }
 
     #[test]
-    fn test_close_card_negative_pnl_uses_loss_emoji_and_signed_roi() {
-        let e = event(EventKind::Close, "-2", "0", Some("-1250.5"));
-        let t = trade("2", "63120", "62000", 45, "-1250.5");
+    fn test_close_card_negative_pnl_shows_signed_pnl_and_roi() {
+        let e = event(EventKind::Close, "-2", "0", Some("-1250"));
+        let t = trade("2", "63120", "62000", 45, "-1250");
         let text = format_card(&ctx(&e, Some(10), None, None, Some(&t)), "W");
-        assert!(text.contains("🔻 -$1,250.50 (-9.9%) · held 45m"), "{text}");
+        assert!(text.contains("NET P/L  -$1,250"), "{text}");
+        assert!(text.contains("ROI      -9.9%"), "{text}");
+        assert!(text.contains("HELD     45m"), "{text}");
+        assert!(text.starts_with("🔴"), "{text}");
     }
 
     #[test]
@@ -593,15 +908,143 @@ mod tests {
         let e = event(EventKind::Close, "-2", "0", Some("2760"));
         let t = trade("2", "63120", "64500", 90, "2760");
         let text = format_card(&ctx(&e, None, None, None, Some(&t)), "W");
-        assert!(text.contains("💰 +$2,760.00 · held 1h30m"), "{text}");
+        assert!(text.contains("NET P/L  +$2,760"), "{text}");
+        assert!(text.contains("HELD     1h30m"), "{text}");
+        assert!(!text.contains("ROI"), "{text}");
         assert!(!text.contains('%'), "{text}");
     }
 
     #[test]
-    fn test_label_is_html_escaped() {
+    fn test_label_is_html_escaped_inside_the_anchor() {
         let e = event(EventKind::Open, "1", "1", None);
         let text = format_card(&ctx(&e, None, None, None, None), "<Whale & 'co'>");
-        assert!(text.starts_with("🟢 <b>&lt;Whale &amp; &#x27;co&#x27;&gt;</b> · <b>BTC</b> Long"));
+        assert!(text.starts_with(
+            "🟢 <b><a href=\"https://app.hyperliquid.xyz/explorer/address/0xa\">\
+             &lt;Whale &amp; &#x27;co&#x27;&gt;</a></b> · BTC LONG"
+        ));
+    }
+
+    #[test]
+    fn test_open_card_shows_upnl_when_marked() {
+        // A mark above the fill price yields a positive uPnL row on the open card.
+        let e = event(EventKind::Open, "2", "2", None);
+        let mut c = ctx(&e, Some(10), Some(d("63500")), None, None);
+        c.avg_entry = Some(d("63120"));
+        let text = format_card(&c, "W");
+        // (63500 - 63120) * 2 = 760
+        assert!(text.contains("uPNL     +$760"), "{text}");
+    }
+
+    // --- live-position snapshot (the 🔄 Update button target) -------------------------------
+
+    fn position(
+        coin: &str,
+        szi: &str,
+        entry: &str,
+        value: &str,
+        upnl: &str,
+        leverage: Option<i64>,
+        liq: Option<&str>,
+    ) -> AccountPosition {
+        AccountPosition {
+            address: "0xa".to_string(),
+            coin: coin.to_string(),
+            szi: Some(d(szi)),
+            entry_px: Some(d(entry)),
+            position_value: Some(d(value)),
+            unrealized_pnl: Some(d(upnl)),
+            liquidation_px: liq.map(d),
+            leverage_type: None,
+            leverage_value: leverage,
+            max_leverage: None,
+        }
+    }
+
+    #[test]
+    fn test_format_live_position_snapshot_with_roi_and_liq_distance() {
+        // value 160125 / size 2.5 => mark 64050.
+        let p = position(
+            "BTC",
+            "2.5",
+            "63120",
+            "160125",
+            "2325",
+            Some(10),
+            Some("57180"),
+        );
+        let now = Utc.with_ymd_and_hms(2026, 6, 15, 12, 41, 0).unwrap();
+        let text = format_live_position("Whale-1", "0xa", &p, now);
+        assert_eq!(
+            text,
+            "🟢 <b><a href=\"https://app.hyperliquid.xyz/explorer/address/0xa\">Whale-1</a></b> · BTC LONG 10x\n\
+             <pre>SIZE     2.5 BTC\n\
+             ENTRY    $63,120\n\
+             MARK     $64,050\n\
+             NOTIONAL $160.1k\n\
+             uPNL     +$2,325  (+14.7%)\n\
+             LIQ      $57,180  -10.7%</pre>\n\
+             🕒 12:41 UTC · updated"
+        );
+    }
+
+    #[test]
+    fn test_format_live_position_short_and_missing_liq() {
+        // Short (szi < 0): SHORT header, red dot, and no LIQ row when the exchange omits it.
+        let p = position("ETH", "-4", "2500", "10000", "-120", Some(5), None);
+        let now = Utc.with_ymd_and_hms(2026, 6, 15, 9, 5, 0).unwrap();
+        let text = format_live_position("W", "0xa", &p, now);
+        assert!(text.starts_with("🔴 "), "{text}");
+        assert!(text.contains("· ETH SHORT 5x"), "{text}");
+        assert!(text.contains("SIZE     4 ETH"), "{text}");
+        assert!(!text.contains("LIQ"), "{text}");
+    }
+
+    #[test]
+    fn test_update_pnl_keyboard_encodes_address_and_coin() {
+        let kb = update_pnl_keyboard("0xabc", "BTC").expect("well under 64 bytes");
+        let btn = &kb["inline_keyboard"][0][0];
+        assert_eq!(btn["callback_data"], "upnl:0xabc:BTC");
+        assert_eq!(btn["text"], "🔄 Update P&L");
+    }
+
+    #[test]
+    fn test_update_pnl_keyboard_drops_button_when_payload_too_long() {
+        // A real 42-char address: "upnl:" (5) + 42 + ":" (1) = 48, leaving 16 bytes for the coin.
+        let addr = format!("0x{}", "a".repeat(40));
+        assert!(update_pnl_keyboard(&addr, &"X".repeat(16)).is_some()); // 48 + 16 = 64
+        assert!(update_pnl_keyboard(&addr, &"X".repeat(17)).is_none()); // 65 > 64 → no button
+    }
+
+    #[test]
+    fn test_format_live_position_omits_roi_without_leverage() {
+        // No leverage → the uPnL row carries the dollar figure but no margin-ROI parenthetical.
+        let p = position("BTC", "2", "63000", "128000", "1000", None, Some("57000"));
+        let now = Utc.with_ymd_and_hms(2026, 6, 15, 12, 0, 0).unwrap();
+        let text = format_live_position("W", "0xa", &p, now);
+        assert!(text.contains("uPNL     +$1,000"), "{text}");
+        assert!(!text.contains('('), "{text}"); // ROI parenthetical omitted
+    }
+
+    #[test]
+    fn test_format_live_position_without_value_omits_mark_notional_and_liq_distance() {
+        let mut p = position("BTC", "2", "63000", "0", "500", Some(10), Some("57000"));
+        p.position_value = None; // no notional → no derived mark, no liq distance
+        let now = Utc.with_ymd_and_hms(2026, 6, 15, 12, 0, 0).unwrap();
+        let text = format_live_position("W", "0xa", &p, now);
+        assert!(!text.contains("MARK"), "{text}");
+        assert!(!text.contains("NOTIONAL"), "{text}");
+        assert!(text.contains("LIQ      $57,000"), "{text}"); // liq shown, bare (no distance)
+        assert!(!text.contains("LIQ      $57,000  "), "{text}"); // no "  ±x%" suffix
+    }
+
+    #[test]
+    fn test_format_live_position_sub_dollar_price_keeps_precision() {
+        // mark = value/size = 560/1000 = 0.56 → the sub-$1 round_price branch keeps decimals.
+        let p = position("HPOS", "1000", "0.5", "560", "60", Some(3), None);
+        let now = Utc.with_ymd_and_hms(2026, 6, 15, 12, 0, 0).unwrap();
+        let text = format_live_position("W", "0xa", &p, now);
+        assert!(text.contains("ENTRY    $0.5"), "{text}");
+        assert!(text.contains("MARK     $0.56"), "{text}");
     }
 
     // --- edit-in-place dispatch -------------------------------------------------------------
@@ -610,21 +1053,44 @@ mod tests {
     struct FakeSender {
         sent: Mutex<Vec<(i64, String)>>,
         edited: Mutex<Vec<(i64, i64, String)>>,
+        // markup presence per send/edit, in call order — asserts the Update button is attached to
+        // open cards and dropped on close.
+        sent_has_kb: Mutex<Vec<bool>>,
+        edited_has_kb: Mutex<Vec<bool>>,
         next_id: AtomicI64,
     }
 
     #[async_trait]
     impl MessageSender for FakeSender {
-        async fn send(&self, chat_id: i64, text: &str) -> Result<i64, SendError> {
+        async fn send(
+            &self,
+            chat_id: i64,
+            text: &str,
+            reply_markup: Option<&Value>,
+        ) -> Result<i64, SendError> {
             let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
             self.sent.lock().unwrap().push((chat_id, text.to_string()));
+            self.sent_has_kb
+                .lock()
+                .unwrap()
+                .push(reply_markup.is_some());
             Ok(id)
         }
-        async fn edit(&self, chat_id: i64, message_id: i64, text: &str) -> Result<(), SendError> {
+        async fn edit(
+            &self,
+            chat_id: i64,
+            message_id: i64,
+            text: &str,
+            reply_markup: Option<&Value>,
+        ) -> Result<(), SendError> {
             self.edited
                 .lock()
                 .unwrap()
                 .push((chat_id, message_id, text.to_string()));
+            self.edited_has_kb
+                .lock()
+                .unwrap()
+                .push(reply_markup.is_some());
             Ok(())
         }
     }
@@ -649,7 +1115,28 @@ mod tests {
         assert_eq!(edited.len(), 1);
         assert_eq!(edited[0].0, 1); // chat
         assert_eq!(edited[0].1, 1); // the id the open's send returned
-        assert!(edited[0].2.contains("Added +1"));
+        assert!(edited[0].2.contains("ADDED    +1 BTC"));
+    }
+
+    #[tokio::test]
+    async fn test_open_carries_update_button_and_close_drops_it() {
+        let sender = Arc::new(FakeSender::default());
+        let notifier = Notifier::new(sender.clone(), true);
+        let rcpt = recipients(&[(1, "W")]);
+
+        let open = event(EventKind::Open, "2", "2", None);
+        notifier
+            .dispatch(&ctx(&open, Some(10), None, None, None), &rcpt)
+            .await;
+        let t = trade("2", "100", "150", 5, "100");
+        let close = event(EventKind::Close, "-2", "0", Some("100"));
+        notifier
+            .dispatch(&ctx(&close, Some(10), None, None, Some(&t)), &rcpt)
+            .await;
+
+        // The open card is sent WITH the 🔄 button; the close edits the card WITHOUT one.
+        assert_eq!(*sender.sent_has_kb.lock().unwrap(), vec![true]);
+        assert_eq!(*sender.edited_has_kb.lock().unwrap(), vec![false]);
     }
 
     #[tokio::test]
@@ -746,14 +1233,25 @@ mod tests {
         }
         #[async_trait]
         impl MessageSender for FlakySender {
-            async fn send(&self, chat_id: i64, _text: &str) -> Result<i64, SendError> {
+            async fn send(
+                &self,
+                chat_id: i64,
+                _text: &str,
+                _reply_markup: Option<&Value>,
+            ) -> Result<i64, SendError> {
                 if chat_id == 1 {
                     return Err("telegram down".into());
                 }
                 self.ok.lock().unwrap().push(chat_id);
                 Ok(self.next_id.fetch_add(1, Ordering::Relaxed) + 1)
             }
-            async fn edit(&self, _c: i64, _m: i64, _t: &str) -> Result<(), SendError> {
+            async fn edit(
+                &self,
+                _c: i64,
+                _m: i64,
+                _t: &str,
+                _reply_markup: Option<&Value>,
+            ) -> Result<(), SendError> {
                 Ok(())
             }
         }
@@ -779,11 +1277,22 @@ mod tests {
         }
         #[async_trait]
         impl MessageSender for EditFails {
-            async fn send(&self, _c: i64, _t: &str) -> Result<i64, SendError> {
+            async fn send(
+                &self,
+                _c: i64,
+                _t: &str,
+                _reply_markup: Option<&Value>,
+            ) -> Result<i64, SendError> {
                 *self.sent.lock().unwrap() += 1;
                 Ok(self.next_id.fetch_add(1, Ordering::Relaxed) + 1)
             }
-            async fn edit(&self, _c: i64, _m: i64, _t: &str) -> Result<(), SendError> {
+            async fn edit(
+                &self,
+                _c: i64,
+                _m: i64,
+                _t: &str,
+                _reply_markup: Option<&Value>,
+            ) -> Result<(), SendError> {
                 Err("message to edit not found".into())
             }
         }

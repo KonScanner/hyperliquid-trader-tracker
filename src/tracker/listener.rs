@@ -417,12 +417,17 @@ impl Listener {
                     // The card carries the fill's tx hash (for a View TX link) and, on a
                     // close, the completed round-trip (entry/exit/PnL/duration). The notifier
                     // edits this subscriber-set's live card in place instead of sending anew.
+                    // The next state carries the blended avg entry (unchanged by a reduce, so it
+                    // is the basis a reduce's ROI is booked against). None on an exact close —
+                    // the close card reads entry from the completed trade instead.
+                    let avg_entry = result.state.as_ref().map(|s| s.avg_entry);
                     let ctx = EventContext {
                         event: &event,
                         leverage,
                         mark,
                         tx_hash: fill.hash.as_deref(),
                         trade: result.closed_trade.as_ref(),
+                        avg_entry,
                     };
                     self.notifier.dispatch(&ctx, &recipients).await;
                 }

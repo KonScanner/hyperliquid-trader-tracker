@@ -32,6 +32,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::Utc;
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 
@@ -40,7 +41,10 @@ use crate::config::{self, Settings};
 use crate::db::WatchlistDB;
 use crate::enrich::Enricher;
 use crate::models::AccountPosition;
-use crate::notifier::{MessageSender, SendError, comma, escape_html as h, pnl, trim};
+use crate::notifier::{
+    MessageSender, SendError, escape_html as h, format_live_position, linked_name, money_short,
+    notional_short, update_pnl_keyboard,
+};
 use crate::registry::{Registry, normalize_address};
 
 /// What a handler may fail with.
@@ -157,7 +161,13 @@ impl Bot {
         parse_mode: Option<&str>,
         reply_markup: Option<&Value>,
     ) -> reqwest::Result<i64> {
-        let mut body = json!({ "chat_id": chat_id, "text": text });
+        let mut body = json!({
+            "chat_id": chat_id,
+            "text": text,
+            // Cards link the trader name and a "View TX"; without this the explorer URL spawns a
+            // preview card that bloats every message (and every silent edit) — always suppress it.
+            "link_preview_options": { "is_disabled": true },
+        });
         if let Some(parse_mode) = parse_mode {
             body["parse_mode"] = json!(parse_mode);
         }
@@ -195,7 +205,13 @@ impl Bot {
         parse_mode: Option<&str>,
         reply_markup: Option<&Value>,
     ) -> reqwest::Result<()> {
-        let mut body = json!({ "chat_id": chat_id, "message_id": message_id, "text": text });
+        let mut body = json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            // Same reasoning as send_message: keep the edited card free of an explorer preview.
+            "link_preview_options": { "is_disabled": true },
+        });
         if let Some(parse_mode) = parse_mode {
             body["parse_mode"] = json!(parse_mode);
         }
@@ -393,28 +409,41 @@ impl TelegramSender {
 
 #[async_trait]
 impl MessageSender for TelegramSender {
-    // Notifications go out HTML-formatted (format_card escapes the user-supplied label), no
-    // keyboard. reqwest errors box into notifier.rs's type-erased SendError (its contract for
-    // Notifier.dispatch's `except Exception`).
-    async fn send(&self, chat_id: i64, text: &str) -> std::result::Result<i64, SendError> {
+    // Notifications go out HTML-formatted (format_card escapes the user-supplied label); the
+    // optional `reply_markup` is the 🔄 Update P&L button on live-position cards. reqwest errors
+    // box into notifier.rs's type-erased SendError (its contract for Notifier.dispatch's
+    // `except Exception`).
+    async fn send(
+        &self,
+        chat_id: i64,
+        text: &str,
+        reply_markup: Option<&Value>,
+    ) -> std::result::Result<i64, SendError> {
         Ok(self
             .app
             .bot()
-            .send_message(chat_id, text, Some(PARSE_MODE_HTML), None)
+            .send_message(chat_id, text, Some(PARSE_MODE_HTML), reply_markup)
             .await?)
     }
 
-    // Edit the live card in place (same HTML formatting, no keyboard) — the silent per-fill
-    // update that replaces sending a new message each time.
+    // Edit the live card in place (same HTML formatting) — the silent per-fill update that
+    // replaces sending a new message each time; carries the same button while the card is open.
     async fn edit(
         &self,
         chat_id: i64,
         message_id: i64,
         text: &str,
+        reply_markup: Option<&Value>,
     ) -> std::result::Result<(), SendError> {
         self.app
             .bot()
-            .edit_message_text(chat_id, message_id, text, Some(PARSE_MODE_HTML), None)
+            .edit_message_text(
+                chat_id,
+                message_id,
+                text,
+                Some(PARSE_MODE_HTML),
+                reply_markup,
+            )
             .await?;
         Ok(())
     }
@@ -675,6 +704,10 @@ impl SettingsBot {
             Some(data) if data.starts_with("pos:") => {
                 self.show_positions(update, &data["pos:".len()..]).await
             }
+            // The 🔄 Update P&L button on a live-position card carries `{address}:{coin}`.
+            Some(data) if data.starts_with("upnl:") => {
+                self.refresh_pnl(update, &data["upnl:".len()..]).await
+            }
             // "help" (and any unknown payload) falls back to the menu
             _ => self.reply(update, HELP, true).await,
         }
@@ -900,6 +933,77 @@ impl SettingsBot {
         }
     }
 
+    /// The 🔄 Update P&L button: re-fetch the wallet's clearinghouse snapshot for one coin and
+    /// edit the card in place with live uPnL/ROI + the liquidation price. `payload` is
+    /// `{address}:{coin}`. The fetch and the edit are best-effort — a transient fetch failure or an
+    /// identical same-minute re-tap ("message is not modified") just leaves the card as-is; only
+    /// the watchlist lookup propagates an error.
+    async fn refresh_pnl(&self, update: &Update, payload: &str) -> Result<()> {
+        let Some(chat_id) = self.chat_id(update) else {
+            return Ok(());
+        };
+        // callback_data is `{address}:{coin}`; the address is 0x-hex (no ':'), so split on the
+        // first ':' — a coin can't contain one either.
+        let Some((raw_addr, coin)) = payload.split_once(':') else {
+            return Ok(());
+        };
+        let Ok(address) = normalize_address(raw_addr) else {
+            return Ok(());
+        };
+        // The card lives in the tapping user's own chat; their label heads the refreshed card.
+        let wallets = self.db.list_for(chat_id).await?;
+        let Some(label) = wallets.get(&address) else {
+            return Ok(()); // no longer following — leave the stale card untouched
+        };
+        // Edit the very message the button hangs off.
+        let Some(message_id) = update
+            .callback_query()
+            .and_then(|q| q.get("message"))
+            .and_then(|m| m.get("message_id"))
+            .and_then(Value::as_i64)
+        else {
+            return Ok(());
+        };
+        match self.enricher.account_positions(&address).await {
+            Ok(positions) => {
+                let (text, keyboard) = match positions.iter().find(|p| p.coin.as_str() == coin) {
+                    Some(p) => (
+                        format_live_position(label, &address, p, Utc::now()),
+                        update_pnl_keyboard(&address, coin),
+                    ),
+                    // Closed since the card was shown — finalize it and drop the button.
+                    None => (
+                        format!("⚪ <b>{}</b> · {} — position closed", h(label), h(coin)),
+                        None,
+                    ),
+                };
+                // Best-effort: a since-deleted card or an identical same-minute re-tap makes the
+                // Bot API return a 4xx; log it rather than bubbling it into the poll loop.
+                if let Err(err) = self
+                    .app
+                    .bot()
+                    .edit_message_text(
+                        chat_id,
+                        message_id,
+                        &text,
+                        Some(PARSE_MODE_HTML),
+                        keyboard.as_ref(),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        "refresh P&L: edit failed (chat={chat_id} msg={message_id}): {err}"
+                    );
+                }
+            }
+            // Transient clearinghouseState failure — log and leave the card as-is.
+            Err(err) => {
+                tracing::warn!("refresh P&L: clearinghouseState failed for {address}: {err:?}");
+            }
+        }
+        Ok(())
+    }
+
     /// Render the sender's watchlist (shared by /list and the 📃 My wallets button).
     async fn show_list(&self, update: &Update) -> Result<()> {
         let Some(chat_id) = self.chat_id(update) else {
@@ -937,13 +1041,28 @@ impl SettingsBot {
     }
 }
 
+/// One rendered row of the `/positions` grid, plus a footer total — cell strings only, so the
+/// column widths can be sized to the widest cell before anything is padded.
+struct PositionRow {
+    coin: String,
+    side: String,
+    value: String,
+    upnl: String,
+}
+
 /// Render one wallet's live open positions — the `/positions` view (pure, unit-tested).
 ///
-/// Largest position (by USD value) first. Per position: size @ avg entry, current value,
-/// unrealized PnL, and the liquidation price when the exchange reports one. The full address
-/// sits in `<code>` so a tap copies something actually usable.
+/// A terminal watchlist: a linked-name header (`📋 name · N open`) over a monospace grid of
+/// `COIN · SIDE+leverage · VALUE · uPNL`, largest position (by USD value) first, closed by a
+/// `TOT` row summing notional and net unrealized PnL. Column widths are sized to the data so a
+/// long ticker or six-figure value can't shear the grid. Notional/PnL are abbreviated (`$128.2k`,
+/// `+$3.1k`) to stay inside the mobile monospace budget; the trader name links to the explorer.
 fn format_positions(label: &str, address: &str, positions: &[AccountPosition]) -> String {
-    let header = format!("📊 <b>{}</b> — <code>{address}</code>", h(label));
+    let header = format!(
+        "📋 {} · {} open",
+        linked_name(address, label),
+        positions.len()
+    );
     if positions.is_empty() {
         return format!("{header}\n\nNo open positions.");
     }
@@ -952,29 +1071,63 @@ fn format_positions(label: &str, address: &str, positions: &[AccountPosition]) -
         let value = |p: &AccountPosition| p.position_value.map(|v| v.abs());
         value(b).cmp(&value(a)).then_with(|| a.coin.cmp(&b.coin))
     });
-    let blocks: Vec<String> = sorted
+
+    let mut total_value = Decimal::ZERO;
+    let mut total_upnl = Decimal::ZERO;
+    let rows: Vec<PositionRow> = sorted
         .iter()
         .map(|p| {
-            // account_positions only hands over non-zero sizes; a missing szi renders as 0 Long.
+            // account_positions only hands over non-zero sizes; a missing szi renders as Long.
             let szi = p.szi.unwrap_or_default();
-            let direction = if szi < Decimal::ZERO { "Short" } else { "Long" };
-            let lev = p
-                .leverage_value
-                .map(|l| format!(" {l}x"))
-                .unwrap_or_default();
-            let entry = p.entry_px.map(trim).unwrap_or_else(|| "?".to_string());
-            let mut detail = format!("{} @ {entry}", trim(szi.abs()));
-            if let Some(value) = p.position_value {
-                detail.push_str(&format!(" (~${})", comma(value.abs(), 0)));
+            let side_letter = if szi < Decimal::ZERO { "S" } else { "L" };
+            let side = match p.leverage_value {
+                Some(l) => format!("{side_letter} {l}x"),
+                None => side_letter.to_string(),
+            };
+            let value = p.position_value.map(|v| v.abs()).unwrap_or(Decimal::ZERO);
+            total_value += value;
+            total_upnl += p.unrealized_pnl.unwrap_or(Decimal::ZERO);
+            PositionRow {
+                coin: p.coin.clone(),
+                side,
+                value: format!("${}", notional_short(value)),
+                upnl: p
+                    .unrealized_pnl
+                    .map(money_short)
+                    .unwrap_or_else(|| "?".to_string()),
             }
-            detail.push_str(&format!(" · uPnL {}", pnl(p.unrealized_pnl)));
-            if let Some(liq) = p.liquidation_px {
-                detail.push_str(&format!(" · liq {}", trim(liq)));
-            }
-            format!("<b>{}</b> {direction}{lev}\n{detail}", h(&p.coin))
         })
         .collect();
-    format!("{header}\n\n{}", blocks.join("\n\n"))
+
+    // The header labels and the TOT row take part in the width fit so every column aligns.
+    let tot_side = format!("{} pos", rows.len());
+    let tot_value = format!("${}", notional_short(total_value));
+    let tot_upnl = money_short(total_upnl);
+    let width = |pick: fn(&PositionRow) -> &str, label: &str, tot: &str| {
+        rows.iter()
+            .map(|r| pick(r).len())
+            .chain([label.len(), tot.len()])
+            .max()
+            .unwrap_or(0)
+    };
+    let (wc, ws, wv, wu) = (
+        width(|r| &r.coin, "COIN", "TOT"),
+        width(|r| &r.side, "SIDE", &tot_side),
+        width(|r| &r.value, "VALUE", &tot_value),
+        width(|r| &r.upnl, "uPNL", &tot_upnl),
+    );
+    // COIN/SIDE left-aligned, VALUE/uPNL right-aligned so the money columns line up on the dot.
+    let line =
+        |c: &str, s: &str, v: &str, u: &str| format!("{c:<wc$}  {s:<ws$}  {v:>wv$}  {u:>wu$}");
+    let head = line("COIN", "SIDE", "VALUE", "uPNL");
+    let body = rows
+        .iter()
+        .map(|r| line(&r.coin, &r.side, &r.value, &r.upnl))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let sep = "-".repeat(head.chars().count());
+    let tot = line("TOT", &tot_side, &tot_value, &tot_upnl);
+    format!("{header}\n<pre>{head}\n{body}\n{sep}\n{tot}</pre>")
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -1018,44 +1171,46 @@ mod tests {
     }
 
     #[test]
-    fn test_format_positions_sorts_by_value_and_renders_each_line() {
+    fn test_format_positions_grid_sorts_by_value_and_totals() {
         let text = format_positions(
             "Whale-1",
             &addr(),
             &[
+                // Deliberately out of order: the renderer sorts by |value| descending.
                 position(
                     "ETH",
-                    "-2",
+                    "-1",
                     "2500",
-                    "5000",
-                    "-12.5",
-                    Some(10),
+                    "37500",
+                    "-820",
+                    Some(5),
                     Some("3100.5"),
                 ),
-                position("GRAM", "39102", "1.6444", "64624", "123.45", Some(5), None),
+                position("BTC", "2", "63000", "128200", "1790", Some(10), None),
             ],
         );
         assert_eq!(
             text,
             format!(
-                "📊 <b>Whale-1</b> — <code>{}</code>\n\n\
-                 <b>GRAM</b> Long 5x\n\
-                 39102 @ 1.6444 (~$64,624) · uPnL +$123.45\n\n\
-                 <b>ETH</b> Short 10x\n\
-                 2 @ 2500 (~$5,000) · uPnL -$12.50 · liq 3100.5",
-                addr()
+                "📋 <b><a href=\"https://app.hyperliquid.xyz/explorer/address/{addr}\">Whale-1</a></b> · 2 open\n\
+                 <pre>COIN  SIDE     VALUE    uPNL\n\
+                 BTC   L 10x  $128.2k  +$1.8k\n\
+                 ETH   S 5x    $37.5k   -$820\n\
+                 ----------------------------\n\
+                 TOT   2 pos  $165.7k   +$970</pre>",
+                addr = addr()
             )
         );
     }
 
     #[test]
-    fn test_format_positions_empty_and_label_escaped() {
+    fn test_format_positions_empty_links_name_and_escapes_label() {
         let text = format_positions("<W&>", &addr(), &[]);
         assert_eq!(
             text,
             format!(
-                "📊 <b>&lt;W&amp;&gt;</b> — <code>{}</code>\n\nNo open positions.",
-                addr()
+                "📋 <b><a href=\"https://app.hyperliquid.xyz/explorer/address/{addr}\">&lt;W&amp;&gt;</a></b> · 0 open\n\nNo open positions.",
+                addr = addr()
             )
         );
     }
