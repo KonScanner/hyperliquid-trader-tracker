@@ -158,6 +158,10 @@ pub struct Settings {
     // is honored in from_env(): the un-prefixed name is checked first, exactly in alias order.
     pub telegram_bot_token: Option<String>,
     pub allowed_chat_ids: String,
+    /// If set (`ADMIN_CHAT_ID`), the bot is locked to this single chat: every command,
+    /// button tap, and notification is gated to it (plus any `allowed_chat_ids` entries).
+    /// Empty = the bot stays public.
+    pub admin_chat_id: String,
 }
 
 impl Default for Settings {
@@ -186,6 +190,7 @@ impl Default for Settings {
             db_path: PathBuf::from("tracker.db"),
             telegram_bot_token: None,
             allowed_chat_ids: String::new(),
+            admin_chat_id: String::new(),
         }
     }
 }
@@ -259,6 +264,10 @@ impl Settings {
             get_env("TELEGRAM_BOT_TOKEN").or_else(|| get_env("TRACKER_TELEGRAM_BOT_TOKEN"));
         if let Some(v) = get_env("TRACKER_ALLOWED_CHAT_IDS") {
             s.allowed_chat_ids = v;
+        }
+        // Same alias convention as the bot token: the un-prefixed name wins.
+        if let Some(v) = get_env("ADMIN_CHAT_ID").or_else(|| get_env("TRACKER_ADMIN_CHAT_ID")) {
+            s.admin_chat_id = v;
         }
         s.validate()?;
         Ok(s)
@@ -353,13 +362,15 @@ impl Settings {
         Ok(())
     }
 
-    /// Parsed allowlist of chat ids; empty = open to anyone (public bot).
+    /// Parsed allowlist of chat ids (`ADMIN_CHAT_ID` + `TRACKER_ALLOWED_CHAT_IDS`);
+    /// empty = open to anyone (public bot).
     // PORT NOTE: @property returning frozenset[int] -> method returning HashSet<i64> by value;
     // the frozen-ness is expressed by handing the caller its own set. Telegram chat ids are
     // i64. Python's int() tolerates surrounding whitespace ("  123 " parses), so we trim
     // before parsing; the ValueError it raised on garbage becomes Err(InvalidChatId).
     pub fn allowed_chat_ids_set(&self) -> Result<HashSet<i64>> {
-        self.allowed_chat_ids
+        let mut ids: HashSet<i64> = self
+            .allowed_chat_ids
             .split(',')
             .filter(|c| !c.trim().is_empty())
             .map(|c| {
@@ -367,7 +378,16 @@ impl Settings {
                     .parse::<i64>()
                     .map_err(|_| Error::InvalidChatId(c.to_string()))
             })
-            .collect()
+            .collect::<Result<_>>()?;
+        let admin = self.admin_chat_id.trim();
+        if !admin.is_empty() {
+            ids.insert(
+                admin
+                    .parse::<i64>()
+                    .map_err(|_| Error::InvalidChatId(admin.to_string()))?,
+            );
+        }
+        Ok(ids)
     }
 
     /// Parsed `live_coins` verbatim (empty list = subscribe to all perps).
@@ -462,6 +482,59 @@ fn check<V: std::fmt::Display>(
             constraint,
             value: value.to_string(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_allowed_chat_ids_set_empty_means_public() {
+        let settings = Settings::default();
+        assert!(
+            settings
+                .allowed_chat_ids_set()
+                .expect("empty config parses")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_admin_chat_id_alone_locks_to_one_chat() {
+        let settings = Settings {
+            admin_chat_id: " 12345 ".to_string(),
+            ..Settings::default()
+        };
+        assert_eq!(
+            settings.allowed_chat_ids_set().expect("admin id parses"),
+            HashSet::from([12345])
+        );
+    }
+
+    #[test]
+    fn test_admin_chat_id_unions_with_allowlist() {
+        let settings = Settings {
+            admin_chat_id: "12345".to_string(),
+            allowed_chat_ids: "-100200, 67890".to_string(),
+            ..Settings::default()
+        };
+        assert_eq!(
+            settings.allowed_chat_ids_set().expect("all ids parse"),
+            HashSet::from([12345, -100200, 67890])
+        );
+    }
+
+    #[test]
+    fn test_admin_chat_id_garbage_is_rejected() {
+        let settings = Settings {
+            admin_chat_id: "@my_channel".to_string(),
+            ..Settings::default()
+        };
+        assert!(matches!(
+            settings.allowed_chat_ids_set(),
+            Err(Error::InvalidChatId(_))
+        ));
     }
 }
 

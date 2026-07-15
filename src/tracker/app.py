@@ -33,6 +33,25 @@ async def _sleep_or_stop(stop: asyncio.Event, seconds: float) -> None:
         await asyncio.wait_for(stop.wait(), timeout=seconds)
 
 
+def _retain_allowed(subs: list[Subscription], allowed: frozenset[int]) -> list[Subscription]:
+    """Drop persisted subscriptions from chats outside the allowlist (no-op when public).
+
+    Command handlers are already gated per-update (bot._chat_id); this extends the same gate
+    to delivery, so a watchlist row written while the bot was public can't keep fanning
+    notifications out to a chat that ADMIN_CHAT_ID / TRACKER_ALLOWED_CHAT_IDS has since
+    locked out. Rows stay in the DB untouched — lifting the gate restores them.
+    """
+    if not allowed:
+        return subs
+    kept = [sub for sub in subs if sub.chat_id in allowed]
+    if len(kept) < len(subs):
+        logger.info(
+            "allowlist active: ignoring %d persisted subscription(s) from non-allowed chats",
+            len(subs) - len(kept),
+        )
+    return kept
+
+
 def _group_by_address(subs: list[Subscription]) -> dict[str, list[Subscription]]:
     grouped: dict[str, list[Subscription]] = defaultdict(list)
     for sub in subs:
@@ -70,14 +89,16 @@ async def _reconcile_loop(
     if settings.reconcile_interval_s <= 0:
         return
     cursor = 0
+    allowed = settings.allowed_chat_ids_set
     while not stop.is_set():
         await _sleep_or_stop(stop, settings.reconcile_interval_s)
         if stop.is_set():
             return
         try:
+            subs = _retain_allowed(await db.all(), allowed)
             pending = {
                 addr: members
-                for addr, members in _group_by_address(await db.all()).items()
+                for addr, members in _group_by_address(subs).items()
                 if not registry.is_tracked(addr)
             }
             if pending:
@@ -140,7 +161,7 @@ async def _amain(settings: Settings) -> None:
             if application.updater is not None:
                 await application.updater.start_polling()
 
-        subscriptions = await db.all()
+        subscriptions = _retain_allowed(await db.all(), settings.allowed_chat_ids_set)
         listener_task = asyncio.create_task(listener.run(), name="listener")
         # The listener only returns once stop is set; if it ever exits unexpectedly, trip stop so
         # the process shuts down cleanly instead of idling forever on `await stop.wait()`.

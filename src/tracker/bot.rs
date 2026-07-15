@@ -1,6 +1,9 @@
 //! Telegram delivery + settings UX (the only module that speaks the live Telegram Bot API).
 //!
-//! A MULTI-TENANT public bot: anyone can message it and manage their own watchlist. Commands
+//! A MULTI-TENANT public bot: anyone can message it and manage their own watchlist — unless
+//! `ADMIN_CHAT_ID` (or `TRACKER_ALLOWED_CHAT_IDS`) is set, in which case every command
+//! (including `/start`/`/help`) and button tap from any other chat is silently ignored
+//! (the [`SettingsBot::chat_id`] gate). Commands
 //! operate on the sender's own chat: `/add <address> <label…>`, `/remove <address>`,
 //! `/rename <address> <label…>`, `/list`, `/positions [address]`, `/help`. Notifications for
 //! a wallet are fanned out to every subscriber of that wallet in their own chat. The core

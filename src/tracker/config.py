@@ -92,11 +92,21 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("TELEGRAM_BOT_TOKEN", "TRACKER_TELEGRAM_BOT_TOKEN"),
     )
     allowed_chat_ids: str = ""
+    # If set (ADMIN_CHAT_ID), the bot is locked to this single chat: every command, button
+    # tap, and notification is gated to it (plus any allowed_chat_ids entries). Empty = the
+    # bot stays public. Un-prefixed alias per the same convention as the bot token.
+    admin_chat_id: str = Field(
+        default="",
+        validation_alias=AliasChoices("ADMIN_CHAT_ID", "TRACKER_ADMIN_CHAT_ID"),
+    )
 
     @property
     def allowed_chat_ids_set(self) -> frozenset[int]:
-        """Parsed allowlist of chat ids; empty = open to anyone (public bot)."""
-        return frozenset(int(c) for c in self.allowed_chat_ids.split(",") if c.strip())
+        """Parsed allowlist (``ADMIN_CHAT_ID`` + ``TRACKER_ALLOWED_CHAT_IDS``); empty = public."""
+        ids = {int(c) for c in self.allowed_chat_ids.split(",") if c.strip()}
+        if self.admin_chat_id.strip():
+            ids.add(int(self.admin_chat_id))
+        return frozenset(ids)
 
     @property
     def live_coins_list(self) -> list[str]:

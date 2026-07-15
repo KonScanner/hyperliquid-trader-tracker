@@ -8,7 +8,7 @@
 //! Nothing but the per-subscriber watchlists is persisted; the book is rebuilt from the chain on
 //! every start.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -57,6 +57,29 @@ async fn sleep_or_stop(stop: &CancellationToken, seconds: f64) {
     }
 }
 
+/// Drop persisted subscriptions from chats outside the allowlist (a no-op when the bot is
+/// public). Command handlers are already gated per-update (bot.rs `chat_id`); this extends
+/// the same gate to delivery, so a watchlist row written while the bot was public can't keep
+/// fanning notifications out to a chat that `ADMIN_CHAT_ID` / `TRACKER_ALLOWED_CHAT_IDS`
+/// has since locked out. Rows stay in the DB untouched — lifting the gate restores them.
+fn retain_allowed(subs: Vec<Subscription>, allowed: &HashSet<i64>) -> Vec<Subscription> {
+    if allowed.is_empty() {
+        return subs;
+    }
+    let before = subs.len();
+    let kept: Vec<Subscription> = subs
+        .into_iter()
+        .filter(|sub| allowed.contains(&sub.chat_id))
+        .collect();
+    let skipped = before - kept.len();
+    if skipped > 0 {
+        tracing::info!(
+            "allowlist active: ignoring {skipped} persisted subscription(s) from non-allowed chats"
+        );
+    }
+    kept
+}
+
 fn group_by_address(subs: Vec<Subscription>) -> HashMap<String, Vec<Subscription>> {
     // PORT NOTE: defaultdict(list) → entry().or_default(). Plain HashMap: iteration order
     // only feeds an unordered concurrent seed sweep, so dict insertion order is unobservable.
@@ -101,6 +124,7 @@ async fn seed_and_admit(
 /// (b) re-seed a rotating batch of tracked wallets to refresh leverage + correct size drift.
 async fn reconcile_loop(
     settings: Settings,
+    allowed: HashSet<i64>,
     enricher: Arc<Enricher>,
     db: Arc<WatchlistDB>,
     registry: Arc<Mutex<Registry>>,
@@ -119,7 +143,7 @@ async fn reconcile_loop(
         // hiccup must not kill the loop). The only fallible call is db.all(); seed paths
         // swallow their own errors — so the match on db.all() is the whole translation.
         let subs = match db.all().await {
-            Ok(subs) => subs,
+            Ok(subs) => retain_allowed(subs, &allowed),
             Err(err) => {
                 tracing::error!("reconcile cycle failed; retrying next interval: {err}");
                 continue;
@@ -196,6 +220,9 @@ async fn telegram_polling_loop(
 }
 
 async fn amain(settings: Settings) -> Result<()> {
+    // Fail fast on a malformed ADMIN_CHAT_ID / TRACKER_ALLOWED_CHAT_IDS — the same set gates
+    // command handling (SettingsBot) and, via retain_allowed, notification fanout.
+    let allowed = settings.allowed_chat_ids_set()?;
     let mut db = WatchlistDB::new(settings.db_path.clone());
     db.connect().await?;
     let db = Arc::new(db);
@@ -293,7 +320,7 @@ async fn amain(settings: Settings) -> Result<()> {
         )));
     }
 
-    let subscriptions = db.all().await?;
+    let subscriptions = retain_allowed(db.all().await?, &allowed);
     let listener_task = tokio::spawn({
         // The listener only returns once stop is set; if it ever exits unexpectedly — by
         // returning OR by panicking — trip stop so the process shuts down cleanly instead
@@ -318,6 +345,7 @@ async fn amain(settings: Settings) -> Result<()> {
     });
     let reconcile_task = tokio::spawn(reconcile_loop(
         settings.clone(),
+        allowed,
         Arc::clone(&enricher),
         Arc::clone(&db),
         Arc::clone(&registry),

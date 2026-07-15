@@ -84,6 +84,23 @@ That's it — there is **no chat id to configure**. This is a public bot: each s
 captured automatically when they message it. (On-chain data needs no key — Hyperliquid's public
 API is unauthenticated.)
 
+### Locking the bot to yourself (`ADMIN_CHAT_ID`)
+
+Because the bot is public by default, anyone who finds it can use it. **If `ADMIN_CHAT_ID` is
+present, the bot is only accessible to you — no one else.** Every command (`/start`, `/help`,
+`/add`, …) and button tap from any other chat is silently ignored, and persisted watchlists
+from other chats stop receiving notifications (their rows stay in the DB — removing the
+variable makes the bot public again). Find your chat id by messaging the bot and running
+`uv run hl-tracker-telegram-setup`, then:
+
+```dotenv
+# .env
+ADMIN_CHAT_ID=123456789
+```
+
+To allow a few extra chats besides the admin, add them to `TRACKER_ALLOWED_CHAT_IDS`
+(comma-separated); the two combine.
+
 ## Run
 
 ```bash
@@ -106,7 +123,8 @@ Then, in Telegram, anyone can DM the bot and manage their own watchlist:
 | Variable | Default | Meaning |
 |---|---|---|
 | `TELEGRAM_BOT_TOKEN` | — | Bot token from @BotFather; without it, notifications are logged only |
-| `TRACKER_ALLOWED_CHAT_IDS` | *(open to all)* | Comma-separated chat-id allowlist to make the bot private |
+| `ADMIN_CHAT_ID` | *(open to all)* | If present, the bot is **only accessible to you** — commands, buttons, and notifications from/to any other chat are ignored |
+| `TRACKER_ALLOWED_CHAT_IDS` | *(open to all)* | Comma-separated chat-id allowlist to make the bot private (combines with `ADMIN_CHAT_ID`) |
 | `TRACKER_NOTIFY_REDUCE_CLOSE` | `true` | Notify on reduce/close (`false` = open+add only) |
 | `TRACKER_RECONCILE_INTERVAL_S` | `45` | Leverage/drift reconcile cadence (`0` disables) |
 | `TRACKER_RECONCILE_BATCH` | `20` | Wallets re-seeded per reconcile cycle |
