@@ -1,8 +1,11 @@
 # hyperliquid-trader-tracker
 
-A **multi-tenant Telegram bot**: anyone can message it, follow Hyperliquid wallets, and get a
-DM whenever a wallet they follow changes a perp position over the **public `trades` firehose** —
-distinguishing a brand-new trade from an increase, and reporting reduces/closes with realized PnL.
+A real-time **Hyperliquid wallet tracker / whale watcher** as a **multi-tenant Telegram bot**,
+written in **Rust**: anyone can message it, follow any wallet trading perps on
+[Hyperliquid](https://hyperliquid.xyz), and get a DM the moment that wallet opens, scales into,
+reduces, or closes a position — with entry, size, notional, leverage, realized/unrealized PnL
+and ROI. Useful for copy trading, whale watching, and monitoring your own accounts, all over the
+**public `trades` firehose**.
 
 - **No auth, no scraping.** Uses only Hyperliquid's sanctioned public API
   (`wss://api.hyperliquid.xyz/ws` + `POST /info`). See [docs/hyperliquid-api-map.md](docs/hyperliquid-api-map.md).
@@ -27,36 +30,53 @@ The **cold-start guarantee**: before a wallet is admitted to the live filter, it
 on-chain positions are seeded silently, so an add on a position opened *before* the tracker
 started is correctly reported as *"Added to position"*, never a false *"Started trade"*.
 
-## Notifications
+## Notifications — one card per position, edited in place
 
-Instead of one message per fill, the bot keeps **one message per position** and **edits it in
-place** as the wallet opens → adds → reduces → closes. Editing is silent (no notification ping),
-so a card stays current without spamming the chat. Every card leads with your label, shows the
-current position, and carries a copyable full address, a **View TX** explorer link, and the fill
-time. An open:
+The bot never sends a message per fill. Each `(wallet, coin)` position gets **one message — a
+"TAPE" card — that is edited in place** through the whole lifecycle: open → add → reduce →
+close. Telegram edits are silent, so you get **one ping when the trade opens** and the card then
+quietly morphs until it ends as the completed round-trip. No spam — and scrolling back shows
+each position's final state, not a trail of stale fills.
 
-```
-🟢 Whale-1 · BTC Long 10x
-Opened 2.5 @ 63120 (≈$157,800)
-👤 0xabc…def
-🔗 View TX · 🕒 12:00 UTC
-```
-
-…is the *same message*, edited, once the wallet closes:
+Cards are terminal-style grids: the same fixed slots across every event, in a monospace block,
+so the numbers a copy-trader acts on always sit in the same place. The trader name in the header
+is a **link to the wallet's explorer page** (the address is one tap away — no noisy raw-address
+line), and the meta line carries a **TX** explorer link and the fill time. A fresh open:
 
 ```
-🔴 Whale-1 · BTC Long 10x
-Closed 2 · 63120 → 64500
-💰 +$2,760.00 (+21.9%) · held 3h12m
-👤 0xabc…def
-🔗 View TX · 🕒 15:12 UTC
+🟢 Whale-1 · BTC LONG 10x
+ENTRY    $63,120
+SIZE     2.5 BTC
+NOTIONAL $157.8k
+🔗 TX · 🕒 12:00 UTC
 ```
 
-Adds show a running total (`Added +1 @ 63120 → 3 total (≈$189,360)`) and reduces show the realized
-PnL and remaining size (`Reduced -0.5 @ 64000 → 2 left · realized +$440.00`). The `+21.9%` on a
-close is the leveraged return on margin (shown when leverage is known). Set
-`TRACKER_NOTIFY_REDUCE_CLOSE=false` to suppress the *new* pings for reduces/closes — the card is
-still edited silently so it never goes stale.
+…becomes, via silent edits, the *same message* once the wallet closes:
+
+```
+🔴 Whale-1 · BTC LONG 10x
+SIZE     2 BTC
+ENTRY    $63,120
+EXIT     $64,500
+NET P/L  +$2,760
+ROI      +21.9%
+HELD     3h12m
+🔗 TX · 🕒 15:12 UTC
+```
+
+In between, an add shows the fill, the % it grew the position, the new blended entry and the
+live uPnL (`ADDED +1 BTC  +50%` / `ENTRY $62,800` / `uPNL +$960`); a reduce shows the booked
+PnL, the ROI on the reduced slice, and what's left (`REDUCED -0.5 BTC  -20%` /
+`REALIZED +$440` / `ROI +14.7%` / `SIZE 2 left`). `ROI` is the leveraged return on margin,
+shown when leverage is known.
+
+Every live card carries a **🔄 Update P&L** button: tapping it re-reads the wallet's on-chain
+state and edits the card into a live snapshot — current `MARK`, fresh `uPNL` + ROI, and the
+liquidation price with its distance from the mark (`LIQ $57,180  -10.7%`).
+
+Set `TRACKER_NOTIFY_REDUCE_CLOSE=false` to suppress *new* reduce/close pings (relevant after a
+restart, when there's no live card left to edit) — an existing card is always edited silently,
+so it never goes stale.
 
 ## Credentials — what you need and how to get it
 
@@ -77,7 +97,7 @@ TELEGRAM_BOT_TOKEN=123456789:AA...
 Verify the token works (and optionally see chat ids that have messaged the bot):
 
 ```bash
-uv run hl-tracker-telegram-setup        # reads TELEGRAM_BOT_TOKEN from .env
+cargo run --bin hl-tracker-telegram-setup   # reads TELEGRAM_BOT_TOKEN from .env
 ```
 
 That's it — there is **no chat id to configure**. This is a public bot: each subscriber's chat is
@@ -91,7 +111,7 @@ present, the bot is only accessible to you — no one else.** Every command (`/s
 `/add`, …) and button tap from any other chat is silently ignored, and persisted watchlists
 from other chats stop receiving notifications (their rows stay in the DB — removing the
 variable makes the bot public again). Find your chat id by messaging the bot and running
-`uv run hl-tracker-telegram-setup`, then:
+`cargo run --bin hl-tracker-telegram-setup`, then:
 
 ```dotenv
 # .env
@@ -103,9 +123,15 @@ To allow a few extra chats besides the admin, add them to `TRACKER_ALLOWED_CHAT_
 
 ## Run
 
+The tracker is a Rust binary; docker is the intended deployment (the original Python
+implementation still lives side by side — `uv run hl-tracker` — but the Rust port is what ships
+and carries the current notification format):
+
 ```bash
-uv sync --extra telegram        # install (omit --extra telegram for log-only mode)
-uv run hl-tracker               # start the bot
+make up                                 # docker: rebuild + start in the background
+make logs                               # follow (notifications land here in log-only mode)
+# or natively:
+cargo run --release --bin hl-tracker    # a.k.a. make run-rs
 ```
 
 Then, in Telegram, anyone can DM the bot and manage their own watchlist:
@@ -116,6 +142,19 @@ Then, in Telegram, anyone can DM the bot and manage their own watchlist:
 /rename 0x6bea…597f Whale     relabel
 /list                        show the wallets you follow
 /positions                   live open positions of a wallet you follow (tap to pick one)
+```
+
+`/positions` renders a terminal watchlist — largest position first, abbreviated money, and a
+`TOT` footer with the wallet's net notional and net unrealized PnL:
+
+```
+📋 Whale-1 · 3 open
+COIN  SIDE     VALUE    uPNL
+BTC   L 10x  $128.2k  +$3.1k
+ETH   S 5x    $64.4k   -$820
+DOGE  L 3x     $9.6k    +$95
+----------------------------
+TOT   3 pos  $202.2k  +$2.4k
 ```
 
 ### Configuration (env vars, or a `.env` at the repo root)
@@ -135,7 +174,6 @@ Then, in Telegram, anyone can DM the bot and manage their own watchlist:
 ## Develop
 
 ```bash
-uv run ruff check . && uv run ruff format --check .
-uv run ty check
-uv run pytest
+make check      # everything: ruff + ty + pytest, plus clippy -D warnings + cargo test + fmt
+make check-rs   # Rust side only
 ```
