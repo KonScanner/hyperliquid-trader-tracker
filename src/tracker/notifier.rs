@@ -173,8 +173,8 @@ pub(crate) fn escape_html(s: &str) -> String {
 /// Base URL of the Hyperliquid (HyperCore) explorer — public trades land here, not on HyperEVM.
 const EXPLORER_TX: &str = "https://app.hyperliquid.xyz/explorer/tx/";
 
-/// Explorer address page — the trader name links here, so a card needs no raw-address line.
-pub(crate) const EXPLORER_ADDR: &str = "https://app.hyperliquid.xyz/explorer/address/";
+/// Hyperdash trader page — the trader name links here, so a card needs no raw-address line.
+pub(crate) const TRADER_PAGE: &str = "https://hyperdash.com/address/";
 
 /// The bold, tap-through trader name used in every card header:
 /// `<b><a href="…/address/{addr}">{label}</a></b>`. Both arguments are HTML-escaped (the label is
@@ -182,7 +182,7 @@ pub(crate) const EXPLORER_ADDR: &str = "https://app.hyperliquid.xyz/explorer/add
 /// `format_live_position`, and the bot's `/positions` view so the header markup lives in one place.
 pub(crate) fn linked_name(address: &str, label: &str) -> String {
     format!(
-        "<b><a href=\"{EXPLORER_ADDR}{}\">{}</a></b>",
+        "<b><a href=\"{TRADER_PAGE}{}\">{}</a></b>",
         escape_html(address),
         escape_html(label)
     )
@@ -223,7 +223,7 @@ fn row(label: &str, value: &str) -> String {
 /// fills arrive, so this same renderer produces the open card, each add/reduce update, and the
 /// final closed card. Line 1 is the header (linked trader name · coin · direction · leverage); a
 /// monospace `<pre>` grid aligns the numbers a copy-trader acts on; the meta line carries a
-/// View TX link and the fill time. The trader name links to the wallet's explorer page, so the
+/// View TX link and the fill time. The trader name links to the wallet's Hyperdash page, so the
 /// raw address needs no line of its own. The subscriber's label is user-supplied and
 /// HTML-escaped; the sender must deliver with `parse_mode=HTML` (bot.rs's TelegramSender does).
 // PORT NOTE: this has moved well past the Python `format_event` two-liner — see the module doc.
@@ -803,7 +803,7 @@ mod tests {
         let text = format_card(&ctx(&e, Some(10), None, None, None), "Whale-1");
         assert_eq!(
             text,
-            "🟢 <b><a href=\"https://app.hyperliquid.xyz/explorer/address/0xa\">Whale-1</a></b> · BTC LONG 10x\n\
+            "🟢 <b><a href=\"https://hyperdash.com/address/0xa\">Whale-1</a></b> · BTC LONG 10x\n\
              <pre>ENTRY    $63,120\n\
              SIZE     2.5 BTC\n\
              NOTIONAL $157.8k</pre>\n\
@@ -819,7 +819,7 @@ mod tests {
         let text = format_card(&c, "W");
         assert_eq!(
             text,
-            "➕ <b><a href=\"https://app.hyperliquid.xyz/explorer/address/0xa\">W</a></b> · BTC LONG 10x\n\
+            "➕ <b><a href=\"https://hyperdash.com/address/0xa\">W</a></b> · BTC LONG 10x\n\
              <pre>ADDED    +1 BTC  +50%\n\
              FILL     $63,120\n\
              SIZE     3 BTC\n\
@@ -836,7 +836,7 @@ mod tests {
         let text = format_card(&ctx(&e, None, None, None, None), "W");
         assert_eq!(
             text,
-            "➕ <b><a href=\"https://app.hyperliquid.xyz/explorer/address/0xa\">W</a></b> · BTC LONG\n\
+            "➕ <b><a href=\"https://hyperdash.com/address/0xa\">W</a></b> · BTC LONG\n\
              <pre>ADDED    +1 BTC  +50%\n\
              FILL     $63,120\n\
              SIZE     3 BTC\n\
@@ -853,7 +853,7 @@ mod tests {
         let text = format_card(&c, "Whale-1");
         assert_eq!(
             text,
-            "➖ <b><a href=\"https://app.hyperliquid.xyz/explorer/address/0xa\">Whale-1</a></b> · BTC LONG 10x\n\
+            "➖ <b><a href=\"https://hyperdash.com/address/0xa\">Whale-1</a></b> · BTC LONG 10x\n\
              <pre>REDUCED  -0.5 BTC  -20%\n\
              FILL     $63,120\n\
              REALIZED +$440\n\
@@ -881,7 +881,7 @@ mod tests {
         let text = format_card(&ctx(&e, Some(10), None, Some("0xbeef"), Some(&t)), "W");
         assert_eq!(
             text,
-            "🔴 <b><a href=\"https://app.hyperliquid.xyz/explorer/address/0xa\">W</a></b> · BTC LONG 10x\n\
+            "🔴 <b><a href=\"https://hyperdash.com/address/0xa\">W</a></b> · BTC LONG 10x\n\
              <pre>SIZE     2 BTC\n\
              ENTRY    $63,120\n\
              EXIT     $64,500\n\
@@ -919,7 +919,7 @@ mod tests {
         let e = event(EventKind::Open, "1", "1", None);
         let text = format_card(&ctx(&e, None, None, None, None), "<Whale & 'co'>");
         assert!(text.starts_with(
-            "🟢 <b><a href=\"https://app.hyperliquid.xyz/explorer/address/0xa\">\
+            "🟢 <b><a href=\"https://hyperdash.com/address/0xa\">\
              &lt;Whale &amp; &#x27;co&#x27;&gt;</a></b> · BTC LONG"
         ));
     }
@@ -976,7 +976,7 @@ mod tests {
         let text = format_live_position("Whale-1", "0xa", &p, now);
         assert_eq!(
             text,
-            "🟢 <b><a href=\"https://app.hyperliquid.xyz/explorer/address/0xa\">Whale-1</a></b> · BTC LONG 10x\n\
+            "🟢 <b><a href=\"https://hyperdash.com/address/0xa\">Whale-1</a></b> · BTC LONG 10x\n\
              <pre>SIZE     2.5 BTC\n\
              ENTRY    $63,120\n\
              MARK     $64,050\n\

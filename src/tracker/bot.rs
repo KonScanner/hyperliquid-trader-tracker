@@ -1059,7 +1059,7 @@ struct PositionRow {
 /// `COIN · SIDE+leverage · VALUE · uPNL`, largest position (by USD value) first, closed by a
 /// `TOT` row summing notional and net unrealized PnL. Column widths are sized to the data so a
 /// long ticker or six-figure value can't shear the grid. Notional/PnL are abbreviated (`$128.2k`,
-/// `+$3.1k`) to stay inside the mobile monospace budget; the trader name links to the explorer.
+/// `+$3.1k`) to stay inside the mobile monospace budget; the trader name links to Hyperdash.
 fn format_positions(label: &str, address: &str, positions: &[AccountPosition]) -> String {
     let header = format!(
         "📋 {} · {} open",
@@ -1195,7 +1195,7 @@ mod tests {
         assert_eq!(
             text,
             format!(
-                "📋 <b><a href=\"https://app.hyperliquid.xyz/explorer/address/{addr}\">Whale-1</a></b> · 2 open\n\
+                "📋 <b><a href=\"https://hyperdash.com/address/{addr}\">Whale-1</a></b> · 2 open\n\
                  <pre>COIN  SIDE     VALUE    uPNL\n\
                  BTC   L 10x  $128.2k  +$1.8k\n\
                  ETH   S 5x    $37.5k   -$820\n\
@@ -1212,7 +1212,7 @@ mod tests {
         assert_eq!(
             text,
             format!(
-                "📋 <b><a href=\"https://app.hyperliquid.xyz/explorer/address/{addr}\">&lt;W&amp;&gt;</a></b> · 0 open\n\nNo open positions.",
+                "📋 <b><a href=\"https://hyperdash.com/address/{addr}\">&lt;W&amp;&gt;</a></b> · 0 open\n\nNo open positions.",
                 addr = addr()
             )
         );
